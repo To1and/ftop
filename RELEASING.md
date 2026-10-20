@@ -28,30 +28,34 @@ the machines being watched, not of the machine running ftop.
 
 ### 1. Repositories
 
-```bash
-git remote add origin git@github.com:To1and/ftop.git
-git push -u origin main
-```
+`To1and/ftop` and `To1and/homebrew-tap` both exist and are public; brew must be
+able to read the tap and download the release without credentials. GoReleaser
+writes `Casks/ftop.rb` into the tap's `main` branch on every release.
 
-Create an empty public `To1and/homebrew-tap`. GoReleaser writes `Casks/ftop.rb`
-into it on the first release; the directory does not need to exist beforehand.
+The tap is written over ssh with a deploy key (write access to that one
+repository only, no expiry). Its private half is the `TAP_DEPLOY_KEY` secret.
+To replace it:
+
+```bash
+ssh-keygen -t ed25519 -N "" -C "ftop release" -f /tmp/tap_key
+gh repo deploy-key add /tmp/tap_key.pub -R To1and/homebrew-tap --allow-write -t "ftop release"
+gh secret set TAP_DEPLOY_KEY -R To1and/ftop < /tmp/tap_key
+rm /tmp/tap_key /tmp/tap_key.pub
+```
 
 ### 2. Developer ID certificate
 
-The Apple Development certificate on this machine cannot sign software
-distributed outside the App Store. You need a **Developer ID Application**
-certificate:
+The Apple Development certificate cannot sign software distributed outside the
+App Store. You need a **Developer ID Application** certificate; only the
+account holder can create one:
 
 - Xcode → Settings → Accounts → Manage Certificates → `+` → *Developer ID
   Application*, or
 - developer.apple.com → Certificates, Identifiers & Profiles → `+` →
   *Developer ID Application*.
 
-Then export it from Keychain Access as a password-protected `.p12`:
-
-```bash
-base64 -i Certificates.p12 | pbcopy   # MACOS_SIGN_P12
-```
+Then export it from Keychain Access (My Certificates → the certificate, with its
+private key → Export) as a password-protected `.p12`.
 
 ### 3. App Store Connect API key
 
@@ -60,13 +64,17 @@ Team Keys → generate a key with the *Developer* role. Download the `.p8` once
 (Apple does not let you download it again), and note the key ID (it is in the
 `.p8` filename) and the issuer ID (a UUID shown above the key list).
 
-```bash
-base64 -i AuthKey_XXXXXXXXXX.p8 | pbcopy   # MACOS_NOTARY_KEY
-```
-
 ### 4. Secrets
 
-In `To1and/ftop` → Settings → Secrets and variables → Actions:
+In `To1and/ftop` → Settings → Secrets and variables → Actions, or with `gh`:
+
+```bash
+base64 -i Certificates.p12 | gh secret set MACOS_SIGN_P12 -R To1and/ftop
+gh secret set MACOS_SIGN_PASSWORD -R To1and/ftop        # prompts for the .p12 password
+base64 -i AuthKey_XXXXXXXXXX.p8 | gh secret set MACOS_NOTARY_KEY -R To1and/ftop
+gh secret set MACOS_NOTARY_KEY_ID -R To1and/ftop -b XXXXXXXXXX
+gh secret set MACOS_NOTARY_ISSUER_ID -R To1and/ftop     # prompts for the issuer UUID
+```
 
 | Secret | Value |
 | --- | --- |
@@ -75,10 +83,14 @@ In `To1and/ftop` → Settings → Secrets and variables → Actions:
 | `MACOS_NOTARY_KEY` | base64 of the `.p8` |
 | `MACOS_NOTARY_KEY_ID` | the 10-character key ID |
 | `MACOS_NOTARY_ISSUER_ID` | the issuer UUID |
-| `TAP_GITHUB_TOKEN` | fine-grained PAT: `To1and/homebrew-tap`, Contents read/write |
+| `TAP_DEPLOY_KEY` | private half of the tap's deploy key (see 1) |
 
 `GITHUB_TOKEN` is supplied by Actions and can only write the repository running
-the workflow, so writing the tap needs its own token.
+the workflow, so writing the tap needs its own credential.
+
+An unsigned binary installed by a cask is quarantined and macOS refuses to run
+it, so a release must not go out without the five `MACOS_*` secrets. With them
+set, the release waits until Apple has accepted the notarization.
 
 ## Local dry run
 

@@ -40,7 +40,9 @@ checksum:
   name_template: checksums.txt
 
 # Signing and notarization are skipped when the secrets are absent, so local
-# snapshots still work. RELEASING.md lists the six secrets this needs.
+# snapshots still work. RELEASING.md lists the secrets this needs. `wait` holds
+# the release until Apple accepts the binaries: a rejected one must fail the
+# release, not ship and then refuse to open.
 notarize:
   macos:
     - enabled: '{{ isEnvSet "MACOS_SIGN_P12" }}'
@@ -53,6 +55,7 @@ notarize:
         issuer_id: "{{ .Env.MACOS_NOTARY_ISSUER_ID }}"
         key_id: "{{ .Env.MACOS_NOTARY_KEY_ID }}"
         key: "{{ .Env.MACOS_NOTARY_KEY }}"
+        wait: true
         timeout: 20m
 
 homebrew_casks:
@@ -61,7 +64,12 @@ homebrew_casks:
       - ftop
     homepage: "https://github.com/To1and/ftop"
     description: "Live GPU, CPU and memory monitor for a whole fleet of machines"
+    # The tap is written over ssh with a deploy key that can push to that one
+    # repository and nothing else.
     repository:
       owner: To1and
       name: homebrew-tap
-      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
+      branch: main
+      git:
+        url: "git@github.com:To1and/homebrew-tap.git"
+        private_key: '{{ envOrDefault "TAP_DEPLOY_KEY" "" }}'

@@ -18,6 +18,16 @@ jobs:
       MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
       MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
     steps:
+      # The config skips signing when the secrets are absent so local snapshots
+      # build; a published release must never be unsigned, so CI insists.
+      - name: Require release secrets
+        env:
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+        run: |
+          for v in MACOS_SIGN_P12 MACOS_SIGN_PASSWORD MACOS_NOTARY_KEY MACOS_NOTARY_KEY_ID MACOS_NOTARY_ISSUER_ID TAP_DEPLOY_KEY; do
+            [ -n "${!v}" ] || { echo "::error::secret $v is not set"; missing=1; }
+          done
+          exit "${missing:-0}"
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
@@ -30,5 +40,6 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # GITHUB_TOKEN can only write this repository; the tap is a second one.
-          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          # GITHUB_TOKEN can only write this repository; the tap is a second one,
+          # written over ssh with a deploy key.
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
