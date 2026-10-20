@@ -1,0 +1,16 @@
+# build output
+/bin/
+
+# The embedded probe is a generated artefact (1.9 MB). `make probe` builds it, and
+# a fresh clone still compiles without it: the embed is behind `-tags probe`.
+/cmd/ftop/probe/ftop-probe
+
+# go
+*.test
+*.out
+
+# prototype generator output
+/out/
+
+# goreleaser output
+/dist/

@@ -1,0 +1,34 @@
+# ftop configuration
+#
+# macOS: ~/Library/Application Support/ftop/config.toml
+# Linux: $XDG_CONFIG_HOME/ftop/config.toml (usually ~/.config/ftop/config.toml)
+#
+# Everything here is optional. Without this file ftop manages every host in
+# ~/.ssh/config.
+
+[general]
+interval = 1.0        # seconds between gauge samples per host (0.5 - 10)
+columns  = 0          # max lanes of cards; 0 = fit the terminal
+
+# Hosts to leave out. Patterns match the ssh alias, the display label, any other
+# name on the same Host line, or the HostName. Glob wildcards are allowed.
+# drop = ["my-laptop", "bastion-*"]
+
+# The board leaves out hosts with no NVIDIA GPU, and hosts the probe cannot run
+# on (macOS, Windows). They are still monitored; the settings panel (o) shows
+# them for the session, and these start the board with them shown.
+# show_cpu_only    = false
+# show_unsupported = false
+
+# Read hosts from this file instead of ~/.ssh/config; it is also passed to ssh -F.
+# ssh_config = "~/.ssh/fleet_config"
+
+[labels]
+# Shorten a card title without touching ~/.ssh/config.
+# "lab-node-1" = "node-1"
+
+# Hosts that are not in the ssh config.
+# [[host]]
+# name     = "lab-gpu"       # the ssh destination
+# label    = "lab"
+# hostname = "192.0.2.10"    # passed to ssh as -o HostName=

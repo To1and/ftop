@@ -1,0 +1,67 @@
+# Release pipeline: `git tag v0.3.0 && git push origin v0.3.0` runs this on CI.
+#
+# ftop is a two-step build: the linux/amd64 probe is cross-compiled first, then the
+# TUI is compiled with `-tags probe` so `//go:embed probe/ftop-probe` finds it. The
+# probe is gitignored, so `before.hooks` must run before any build starts.
+version: 2
+
+project_name: ftop
+
+before:
+  hooks:
+    - make probe
+
+builds:
+  - id: ftop
+    main: ./cmd/ftop
+    binary: ftop
+    tags:
+      - probe
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - arm64
+      - amd64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X main.version={{ .Version }}
+
+archives:
+  - id: ftop
+    formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+# Signing and notarization are skipped when the secrets are absent, so local
+# snapshots still work. RELEASING.md lists the six secrets this needs.
+notarize:
+  macos:
+    - enabled: '{{ isEnvSet "MACOS_SIGN_P12" }}'
+      ids:
+        - ftop
+      sign:
+        certificate: "{{ .Env.MACOS_SIGN_P12 }}"
+        password: "{{ .Env.MACOS_SIGN_PASSWORD }}"
+      notarize:
+        issuer_id: "{{ .Env.MACOS_NOTARY_ISSUER_ID }}"
+        key_id: "{{ .Env.MACOS_NOTARY_KEY_ID }}"
+        key: "{{ .Env.MACOS_NOTARY_KEY }}"
+        timeout: 20m
+
+homebrew_casks:
+  - name: ftop
+    binaries:
+      - ftop
+    homepage: "https://github.com/To1and/ftop"
+    description: "Live GPU, CPU and memory monitor for a whole fleet of machines"
+    repository:
+      owner: To1and
+      name: homebrew-tap
+      token: "{{ .Env.TAP_GITHUB_TOKEN }}"
