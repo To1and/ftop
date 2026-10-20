@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -53,58 +54,103 @@ func TestFreeCardLampIsDark(t *testing.T) {
 	}
 }
 
-// TestBreathIsVisibleAndNeverOut: the breath must stay visible for its whole
-// cycle. A lamp that faded to the page colour would spend most of its period
-// invisible, and a claim is not a thing that sometimes isn't there.
-func TestBreathIsVisibleAndNeverOut(t *testing.T) {
-	st := lampStateOf(Holder{Owner: "claude-code/x"}, true, 0)
-	brand := st.colour
-	worst := 0.0
-	for ms := 0; ms < int(lampBreath/time.Millisecond); ms += 50 {
-		_, fg := lampCell(st, lampAt(ms))
-		if d := theme.DeltaE(fg, theme.Default.Track()); d < worst || worst == 0 {
-			worst = d
+// TestLampTurnsOnlyWhileBusy: a held card that is idle shows its holder's
+// resting mark and holds still; a busy one turns through its holder's spinner.
+// The colour is the holder's at every frame of both.
+func TestLampTurnsOnlyWhileBusy(t *testing.T) {
+	for _, owner := range []string{"claude-code/x", "codex/x", "human/x"} {
+		idle := lampStateOf(Holder{Owner: owner}, true, 2)
+		busy := lampStateOf(Holder{Owner: owner}, true, 80)
+		brand := agentColourFor(owner)
+		still, turning := map[string]bool{}, map[string]bool{}
+		for ms := 0; ms < 2400; ms += 20 {
+			g, fg := lampCell(idle, lampAt(ms))
+			still[g] = true
+			if fg != brand {
+				t.Errorf("%s idle at %dms is %s, not its brand colour", owner, ms, fg.Hex())
+			}
+			g, fg = lampCell(busy, lampAt(ms))
+			turning[g] = true
+			if fg != brand {
+				t.Errorf("%s busy at %dms is %s, not its brand colour", owner, ms, fg.Hex())
+			}
 		}
-		// Hue is held for the whole cycle: only lightness moves.
-		_, _, h := theme.OKLCHOf(fg)
-		_, _, hb := theme.OKLCHOf(brand)
-		if d := absAngle(h - hb); d > 12 {
-			t.Fatalf("at %dms the breath has drifted %.0f° in hue", ms, d)
+		if len(still) != 1 {
+			t.Errorf("%s: an idle claim moves through %d glyphs", owner, len(still))
 		}
-	}
-	if worst < 12 {
-		t.Errorf("the dark end of the breath is only ΔE %.1f from the track", worst)
+		if len(turning) < 4 {
+			t.Errorf("%s: a busy card shows only %d glyphs; it does not turn", owner, len(turning))
+		}
 	}
 }
 
-// TestBreathIsAPureFunctionOfTime: the same timestamp draws the same lamp, so a
+// TestEachAgentInItsOwnIdiom: Claude Code and Codex lamps are their own
+// spinners, so the two read apart by shape as well as colour, and an agent ftop
+// has no idiom for still gets a lamp that turns.
+func TestEachAgentInItsOwnIdiom(t *testing.T) {
+	seen := func(owner string, util float64) map[string]bool {
+		st := lampStateOf(Holder{Owner: owner}, true, util)
+		out := map[string]bool{}
+		for ms := 0; ms < 2400; ms += 10 {
+			g, _ := lampCell(st, lampAt(ms))
+			out[g] = true
+		}
+		return out
+	}
+	claude, codex := seen("claude-code/a", 80), seen("codex/b", 80)
+	for g := range claude {
+		if codex[g] {
+			t.Errorf("claude and codex share the frame %q", g)
+		}
+	}
+	if !claude["✻"] || !codex["⠋"] {
+		t.Errorf("the spinners are not the agents' own: claude %v, codex %v", claude, codex)
+	}
+	if g, _ := lampCell(lampStateOf(Holder{Owner: "claude-code/a"}, true, 0), lampAt(0)); g != "✻" {
+		t.Errorf("an idle claude claim rests on %q, want ✻", g)
+	}
+}
+
+// TestLampGlyphsAreOneCell: every frame of every idiom is one cell wide. A
+// spinner frame two cells wide would push the row it sits in one cell right on
+// that frame only, and the card would shudder.
+func TestLampGlyphsAreOneCell(t *testing.T) {
+	styles := []lampStyle{lampStyleOther}
+	for _, s := range lampStyles {
+		styles = append(styles, s)
+	}
+	for _, s := range styles {
+		for _, g := range append([]string{s.rest}, s.spin...) {
+			if w := theme.RuneWidth(g); w != 1 {
+				t.Errorf("%q is %d cells wide", g, w)
+			}
+		}
+	}
+}
+
+// TestLampIsAPureFunctionOfTime: the same timestamp draws the same lamp, so a
 // snapshot is reproducible and a dropped frame does not shift the phase.
-func TestBreathIsAPureFunctionOfTime(t *testing.T) {
-	st := lampStateOf(Holder{Owner: "codex/x"}, true, 0)
+func TestLampIsAPureFunctionOfTime(t *testing.T) {
+	st := lampStateOf(Holder{Owner: "codex/x"}, true, 80)
 	for _, ms := range []int{0, 137, 700, 1200, 2333} {
-		_, a := lampCell(st, lampAt(ms))
-		_, b := lampCell(st, lampAt(ms))
+		a, _ := lampCell(st, lampAt(ms))
+		b, _ := lampCell(st, lampAt(ms))
 		if a != b {
 			t.Errorf("t=%dms is not deterministic", ms)
 		}
 	}
-	// And it does move.
-	_, a := lampCell(st, lampAt(0))
-	_, b := lampCell(st, lampAt(1200))
-	if a == b {
-		t.Error("the breath does not move over half a period")
-	}
 }
 
-// TestOverdueLampIsUnmissable: an overdue claim keeps the warning colour and
-// does not breathe, so it is at full brightness whenever the reader looks.
+// TestOverdueLampIsUnmissable: an overdue claim is a still dot in the warning
+// colour, busy or not, so it is never mistaken for live work.
 func TestOverdueLampIsUnmissable(t *testing.T) {
-	h := Holder{Owner: "claude-code/x", Overdue: true}
-	st := lampStateOf(h, true, 0)
 	warn := theme.Default.C("warn")
-	for ms := 0; ms < int(lampBreath/time.Millisecond); ms += 100 {
-		if _, fg := lampCell(st, lampAt(ms)); fg != warn {
-			t.Fatalf("overdue lamp is %s at %dms, not the warning colour", fg.Hex(), ms)
+	for _, util := range []float64{0, 90} {
+		st := lampStateOf(Holder{Owner: "claude-code/x", Overdue: true}, true, util)
+		for ms := 0; ms < 2400; ms += 50 {
+			if g, fg := lampCell(st, lampAt(ms)); fg != warn || g != lampGlyph {
+				t.Fatalf("overdue lamp at %dms is %q %s, not a still warning dot", ms, g, fg.Hex())
+			}
 		}
 	}
 }
@@ -146,10 +192,33 @@ func absAngle(d float64) float64 {
 }
 
 func containsLamp(s string) bool {
-	for _, r := range s {
-		if r == '●' || r == '·' {
+	return strings.Contains(s, lampGlyphID) || containsLitLamp(s)
+}
+
+// containsLitLamp reports whether any lit lamp, of any idiom, is in s.
+func containsLitLamp(s string) bool {
+	for _, g := range litLampGlyphs() {
+		if strings.Contains(s, g) {
 			return true
 		}
 	}
 	return false
+}
+
+// litLampGlyphs is every glyph a lit lamp can show, in any idiom, less the dot
+// a free card shows.
+func litLampGlyphs() []string {
+	styles := []lampStyle{lampStyleOther}
+	for _, st := range lampStyles {
+		styles = append(styles, st)
+	}
+	var out []string
+	for _, st := range styles {
+		for _, g := range append([]string{st.rest}, st.spin...) {
+			if g != lampGlyphID {
+				out = append(out, g)
+			}
+		}
+	}
+	return out
 }

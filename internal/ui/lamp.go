@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"math"
 	"time"
 
 	"ftop/internal/theme"
@@ -16,32 +15,35 @@ import (
 // four that are free. The index column already has a cell beside every GPU that no
 // other field uses, so the answer can sit next to the row it is about.
 //
-// A lamp has three things to say and only one of them is about colour:
+// A lamp has three things to say:
 //
 //	free            a dark dot, still
-//	held            a dot in the holder's brand colour, breathing
-//	held and busy   the same dot, steady
+//	held            the holder's resting mark, in its brand colour, still
+//	held and busy   the holder's own spinner, in its brand colour, turning
 //
-// Motion is the second channel on purpose. A card can be claimed by an agent that
-// is between jobs, and it can be claimed by one that is mid-run; those are
-// different facts about the machine, and the board already draws utilisation for
-// the second. Breathing says "claimed, nothing running" and stopping says "running
-// now", so the reader can tell a stale claim from live work without reading the
-// bar. It also keeps hue doing exactly one job — who holds it — which is the same
-// division the ramps make between hue and lightness.
+// Each agent is drawn in its own idiom: the spinner it shows in its own terminal
+// while it works, and the mark it rests on — Claude Code's ✻ flower, Codex's
+// braille dots. A reader who uses these tools already reads that spinner as "this
+// agent is working", so the lamp borrows a meaning instead of teaching one, and
+// the shape says who holds the card before the colour does.
+//
+// Motion means "running now", which is what a spinner means everywhere else. A
+// card can be claimed by an agent that is between jobs, and it can be claimed by
+// one that is mid-run; those are different facts about the machine, and a still
+// mark beside a turning one tells a stale claim from live work without reading
+// the bar. (The first lamp had it the other way round, breathing while idle; a
+// pulse on the claim that was doing nothing read as the busy one.)
 //
 // The lamp's colour is the holder's, not a single "agent" colour: two agents can
-// hold cards on one host, and a brand colour is the one thing that tells them
-// apart at a glance.
+// hold cards on one host, and the brand colour is what tells them apart where a
+// glyph is too small to.
 
-// lampBreath is one full breath: dark to bright and back.
-//
-// Slow enough to read as a breath rather than a blink. A blink at this size reads
-// as an alarm, and a blink that means "someone has a claim" trains the reader to
-// ignore the one thing on the board that should mean something is wrong.
-const lampBreath = 2400 * time.Millisecond
+// snapshotAt is the moment a snapshot draws its lamps at (-once, the demo, and
+// tests): a fixed phase, so two runs print the same bytes. It is mid-cycle for
+// every spinner, where each shows a full mark rather than its opening dot.
+const snapshotAt = 500 * time.Millisecond
 
-// lampGlyph is the lit lamp.
+// lampGlyph is a lit lamp whose holder has no idiom of its own.
 //
 // A filled circle is the one shape that reads as a lamp at a single cell: it is
 // solid at every size, which the crescent and ring glyphs are not, and it does not
@@ -52,17 +54,59 @@ const (
 	lampGlyphID = "·"
 )
 
+// lampStyle is one holder's idiom: the frames it turns through while busy, how
+// long it shows each, and the mark it rests on.
+type lampStyle struct {
+	spin []string
+	step time.Duration
+	rest string
+}
+
+// lampStyles are the idioms the lamp knows, keyed by the claim's runtime.
+//
+// Claude Code turns ·✢✳✶✻✽ and back and rests on ✻ (its "worked for" line).
+// Codex turns the ten-frame braille spinner of codex-tui's status line and rests
+// on the • its working line begins with. A holder ftop has no idiom for —
+// "human", or an agent that named itself — turns a half-lit disc and rests on
+// the plain dot: it still says busy or idle, in a shape that claims no brand.
+//
+// Every spinner steps on one 100 ms clock, near both agents' own (Claude Code
+// 120 ms, Codex 80 ms). At their own rates the two together changed the screen
+// on the steps of either, 17 times a second, and every change is a whole frame
+// for the renderer to compare and send; on one clock it is 10.
+var lampStyles = map[string]lampStyle{
+	"claude-code": {
+		spin: []string{"·", "✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳", "✢"},
+		step: 100 * time.Millisecond,
+		rest: "✻",
+	},
+	"codex": {
+		spin: []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"},
+		step: 100 * time.Millisecond,
+		rest: "•",
+	},
+}
+
+var lampStyleOther = lampStyle{
+	spin: []string{"◐", "◓", "◑", "◒"},
+	step: 200 * time.Millisecond,
+	rest: lampGlyph,
+}
+
 // lampState is what a card's lamp has to say this frame.
 type lampState struct {
 	// lit is false for a free card and for a card the ledger has no answer for.
 	lit bool
 	// colour is the holder's brand colour when lit.
 	colour theme.RGB
-	// busy is true when the card is being used, which stops the breath.
+	// busy is true when the card is being used, which sets the lamp turning.
 	busy bool
-	// overdue marks a claim past its declared time; it keeps the holder's colour
-	// but is drawn at full brightness so it cannot be missed while dim.
+	// overdue marks a claim past its declared time; it is drawn as a still dot
+	// in the warning colour.
 	overdue bool
+	// kind is the holder's runtime ("claude-code", "codex", "human"), which
+	// picks the idiom the lamp is drawn in.
+	kind string
 }
 
 // lampFor decides a card's lamp from the ledger and the measurement.
@@ -83,6 +127,7 @@ func lampFor(h Holder, ok bool, g wireGPU) lampState {
 		colour:  agentColourFor(h.Owner),
 		busy:    busy,
 		overdue: h.Overdue,
+		kind:    kindOf(h.Owner),
 	}
 }
 
@@ -92,9 +137,10 @@ type wireGPU struct{ util float64 }
 
 // lampCell renders a lamp's glyph and colour at a moment.
 //
-// The brightness is a function of the frame's timestamp, never of the wall clock:
-// the same frame drawn twice is the same picture, which is what lets -once and the
-// plain-text snapshot be compared against a golden file.
+// The frame is a function of the frame's timestamp, never of the wall clock: the
+// same frame drawn twice is the same picture, which is what lets -once and the
+// plain-text snapshot be compared against a golden file. Every lamp of one
+// holder turns in step, so a host's busy cards read as one run.
 func lampCell(st lampState, now time.Time) (glyph string, fg theme.RGB) {
 	if !st.lit {
 		// A free card's lamp is drawn, not left blank. Blank is also what a lane
@@ -102,57 +148,68 @@ func lampCell(st lampState, now time.Time) (glyph string, fg theme.RGB) {
 		return lampGlyphID, theme.Default.Track()
 	}
 	if st.overdue {
-		// Readable at every point of the breath: an overdue claim is the one state
-		// where the reader must not have to wait for the cycle to peak.
+		// Still, and in the warning colour rather than the holder's: an overdue
+		// claim is the one state the reader must not mistake for live work.
 		return lampGlyph, theme.Default.C("warn")
 	}
-	if st.busy {
-		return lampGlyph, st.colour
+	sty, ok := lampStyles[st.kind]
+	if !ok {
+		sty = lampStyleOther
 	}
-	return lampGlyph, breathe(st.colour, now)
-}
-
-// breathe dims and restores a colour on the lamp's period.
-//
-// It mixes toward the hidden end of the same colour rather than toward the page:
-// a lamp that faded to black on a dark card would vanish, and a lamp that faded to
-// white would change hue as it rose. Mixing toward the track keeps the hue exactly
-// where the brand put it for the whole cycle, so "who holds this" never flickers.
-//
-// The floor is 0.40 rather than 0: at 0.30 the dark end sat ΔE 11.5 from the track,
-// close enough that on a dim panel the claim seemed to go away and come back. At
-// 0.40 both brands' dark ends clear the track by ΔE 16 and the breath reads as a
-// change of brightness on a lamp that is always on.
-func breathe(c theme.RGB, now time.Time) theme.RGB {
-	// A cosine rather than a triangle: a linear ramp visibly snaps at both ends at
-	// this size, and the lamp is a single cell, so the shape of the curve is most
-	// of what makes it read as a breath.
-	t := float64(now.UnixNano()%int64(lampBreath)) / float64(lampBreath)
-	f := 0.5 - 0.5*math.Cos(2*math.Pi*t) // 0 at the dark end, 1 at the bright one
-	f = 0.40 + 0.60*f                    // never fully out: the claim is always visible
-	return mixRGB(theme.Default.Track(), c, f)
-}
-
-// mixRGB blends two colours; t=0 is a, t=1 is b.
-func mixRGB(a, b theme.RGB, t float64) theme.RGB {
-	if t < 0 {
-		t = 0
+	if !st.busy {
+		return sty.rest, st.colour
 	}
-	if t > 1 {
-		t = 1
-	}
-	blend := func(x, y int) int {
-		return int(float64(x) + float64(y-x)*t + 0.5)
-	}
-	return theme.RGB{R: blend(a.R, b.R), G: blend(a.G, b.G), B: blend(a.B, b.B)}
+	return sty.spin[int(now.UnixNano()/int64(sty.step))%len(sty.spin)], st.colour
 }
 
 // agentColourFor maps a claim's owner string ("kind/session") to its brand colour.
 func agentColourFor(owner string) theme.RGB {
+	return theme.Default.AgentColour(kindOf(owner))
+}
+
+// kindOf is the runtime part of a claim's owner string ("kind/session").
+func kindOf(owner string) string {
 	for i := 0; i < len(owner); i++ {
 		if owner[i] == '/' {
-			return theme.Default.AgentColour(owner[:i])
+			return owner[:i]
 		}
 	}
-	return theme.Default.AgentColour(owner)
+	return owner
+}
+
+// lampStep is how long a lamp shows each frame of its spinner, or 0 for a lamp
+// that holds still.
+func lampStep(st lampState) time.Duration {
+	if !st.lit || st.overdue || !st.busy {
+		return 0
+	}
+	sty, ok := lampStyles[st.kind]
+	if !ok {
+		sty = lampStyleOther
+	}
+	return sty.step
+}
+
+// refreshSpin records how often the board's turning lamps change frame: the
+// greatest step that lands on every one of their frames, so lamps of different
+// steps on one board are all drawn on time.
+// Called with a.mu held, wherever the holders or the readings change.
+func (a *App) refreshSpin() {
+	var step time.Duration
+	for _, st := range a.states {
+		for _, g := range st.sample.Gpus {
+			h, ok := a.holders[ledgerKey(st.name, g)]
+			if s := lampStep(lampFor(h, ok, wireGPU{util: g.UtilPct()})); s > 0 {
+				step = gcdDuration(step, s)
+			}
+		}
+	}
+	a.spinStep.Store(int64(step))
+}
+
+func gcdDuration(a, b time.Duration) time.Duration {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	return a
 }

@@ -1,6 +1,9 @@
 package theme
 
-import "strings"
+import (
+	"strings"
+	"sync"
+)
 
 // Skin is the palette the UI draws with, plus one scale per measurement.
 //
@@ -180,25 +183,63 @@ func PadLeft(s string, w int) string {
 	return s
 }
 
-// RGBScale is a measurement's colour walk, sampled at one-step resolution.
+// RGBScale is a measurement's colour walk, sampled finely enough that no reader
+// can tell the samples from the ramp.
 //
 // It used to be eleven samples taken off a btop gradient with a "floor" that
 // skipped the unreadably dark opening entries. There is no floor any more: the
 // ramps are specified in OKLCH with a lightness that is already chosen for a dark
 // background, so the whole range is usable and the scale is a straight sample of
 // the ramp.
+//
+// The samples are a table rather than a cache of the exact walk because a colour
+// off the ramp costs a gamut search (maxChroma), and every cell of every meter
+// asks for one: at the frame rate the board animates at, that search was a fifth
+// of the program's CPU. Neighbouring entries a thousandth of the ramp apart are
+// far under a just-noticeable difference.
 type RGBScale struct {
 	ramp  ramp
-	steps [101]RGB
+	steps []RGB // the ramp at every 1/scaleSteps of its span, shared by copies
 }
 
-// newScale samples a measurement's ramp.
+// scaleSteps is the table's resolution: a thousandth of the ramp.
+const scaleSteps = 1000
+
+// newScale samples a measurement's ramp. A ramp is sampled once per process and
+// the table shared: every skin of one theme asks for the same six.
 func newScale(t *Theme, name string) RGBScale {
-	s := RGBScale{ramp: t.Ramp(name)}
-	for i := range s.steps {
-		s.steps[i] = s.ramp.at(float64(i) / 100)
+	r := t.Ramp(name)
+	scaleMu.Lock()
+	defer scaleMu.Unlock()
+	steps, ok := scaleTables[r]
+	if !ok {
+		steps = make([]RGB, scaleSteps+1)
+		for i := range steps {
+			steps[i] = r.at(float64(i) / scaleSteps)
+		}
+		scaleTables[r] = steps
 	}
-	return s
+	return RGBScale{ramp: r, steps: steps}
+}
+
+var (
+	scaleMu     sync.Mutex
+	scaleTables = map[ramp][]RGB{}
+)
+
+// sample is the table entry nearest t (0..1). A zero RGBScale, which no theme
+// builds, falls back to the ramp itself.
+func (s RGBScale) sample(t float64) RGB {
+	if s.steps == nil {
+		return s.ramp.at(t)
+	}
+	if !(t > 0) { // and NaN
+		t = 0
+	}
+	if t > 1 {
+		t = 1
+	}
+	return s.steps[int(t*scaleSteps+0.5)]
 }
 
 // At is the scale's colour for v in 0..100.
@@ -209,7 +250,7 @@ func (s RGBScale) At(v float64) RGB {
 	if v > 100 {
 		v = 100
 	}
-	return s.ramp.at(v / 100)
+	return s.sample(v / 100)
 }
 
 // Top is the scale's brightest colour.
@@ -218,4 +259,4 @@ func (s RGBScale) Top() RGB { return s.steps[len(s.steps)-1] }
 // AtFraction is a ramp's colour for a fraction of its span, which is what a
 // progress bar needs: the cells of a bar interpolate from the ramp's start to the
 // reading, not from 0 to 100.
-func (s RGBScale) AtFraction(t float64) RGB { return s.ramp.at(t) }
+func (s RGBScale) AtFraction(t float64) RGB { return s.sample(t) }

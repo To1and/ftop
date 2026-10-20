@@ -39,7 +39,7 @@ func TestLampHoldsEveryLayout(t *testing.T) {
 					t.Fatalf("w=%d n=%d: line %d is %d cells wide", w, n, i, len(r))
 				}
 			}
-			if !strings.Contains(frame, "●") {
+			if !containsLitLamp(frame) {
 				t.Errorf("w=%d n=%d: no lit lamp on the board", w, n)
 			}
 			if !strings.Contains(frame, "held: ") {
@@ -58,8 +58,10 @@ func TestNoHoldersNoLitLamp(t *testing.T) {
 	// A two-line row's second line starts with its lamp. On a board with no
 	// claims every one of those is the dark dot: the lamp is present and out,
 	// which is the state the reader needs to be able to tell from "no lamp here".
-	if strings.Contains(frame, "●   ■") {
-		t.Error("an unclaimed board lit a lamp")
+	for _, g := range litLampGlyphs() {
+		if strings.Contains(frame, g+"   ■") {
+			t.Errorf("an unclaimed board lit a lamp: %q", g)
+		}
 	}
 	if a.anyHeld.Load() {
 		t.Error("anyHeld is set with no holders")

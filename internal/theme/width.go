@@ -38,6 +38,17 @@ var replacement = Glyph{Text: "?", W: 1}
 // Zero-width clusters (a combining mark with nothing to combine with) are
 // dropped: they have no cell to be drawn in.
 func EachGlyph(s string, fn func(Glyph) bool) {
+	// Most strings drawn are one glyph — a block, a rule, a dot — and a frame draws
+	// thousands of them. Segmenting each afresh was an eighth of a frame's CPU, so
+	// a string already known to be exactly one cluster is answered from a cache.
+	if len(s) <= 16 && len(s) > 0 && s[0] >= 0x80 {
+		if v, ok := singleCache.Load(s); ok {
+			if g := v.(Glyph); g.W > 0 {
+				fn(g)
+			}
+			return
+		}
+	}
 	for len(s) > 0 {
 		// Fast path: printable ASCII not followed by a combining continuation.
 		if c := s[0]; c >= 0x20 && c < 0x7f && (len(s) == 1 || s[1] < 0x80) {
@@ -51,8 +62,12 @@ func EachGlyph(s string, fn func(Glyph) bool) {
 		if cluster == "" {
 			cluster = s[:1]
 		}
+		whole := len(cluster) == len(s)
 		s = s[len(cluster):]
 		g := glyphOf(cluster)
+		if whole && len(cluster) <= 16 {
+			singleCache.Store(cluster, g)
+		}
 		if g.W == 0 {
 			continue
 		}
@@ -63,6 +78,9 @@ func EachGlyph(s string, fn func(Glyph) bool) {
 }
 
 var glyphCache sync.Map // cluster -> Glyph
+
+// singleCache maps a string that is exactly one cluster to its glyph.
+var singleCache sync.Map
 
 // glyphOf sanitises and measures one cluster.
 func glyphOf(cluster string) Glyph {

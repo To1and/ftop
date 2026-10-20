@@ -72,8 +72,8 @@ func (a *App) drawCards(c *Canvas, top int, hosts []*hostState, graph bool) int 
 	// PlainFrame both lock around the whole render), and a second Lock here deadlocks
 	// the first frame.
 	holders := a.holders
-	cs := cardStyle{interval: a.interval}
-	// One timestamp for the whole frame: every lamp on the board breathes in step,
+	cs := cardStyle{interval: a.interval, glide: a.glideTo}
+	// One timestamp for the whole frame: every lamp on the board turns in step,
 	// which is what makes them read as lamps on one machine rather than as eight
 	// independent animations.
 	now := a.clock()

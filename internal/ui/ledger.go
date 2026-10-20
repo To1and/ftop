@@ -57,6 +57,7 @@ func (a *App) applyLedger(m LedgerMsg) {
 	// the one place the holder set changes, as an atomic the tick can read without
 	// the lock.
 	a.anyHeld.Store(len(a.holders) > 0)
+	a.refreshSpin()
 }
 
 // holderFor returns the ledger answer for a card, if there is one.

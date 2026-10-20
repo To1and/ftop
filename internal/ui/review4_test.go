@@ -209,66 +209,57 @@ func TestSkylineAxisIsPerHost(t *testing.T) {
 	}
 }
 
-// TestSkylineBarsCarryTheirMetric: every bar of a metric is one colour, and that
-// colour identifies the metric. The bar's height is the reading, so tinting by
-// the reading too said it twice and faded the chart to near-white at the top;
-// shading a three-cell bar along its height was banding, not a gradient.
-func TestSkylineBarsCarryTheirMetric(t *testing.T) {
-	read := func(util, mem float64) map[string]map[theme.RGB]bool {
-		a := New(Options{Hosts: []string{"h"}, GraphRows: 1})
-		a.width, a.height = 200, 40
-		used, total := uint64(24000), uint64(24000)
-		a.Deliver(sshxSample("h", wire.Sample{Gpus: []wire.Gpu{{
-			Index: 0, Name: "RTX 4090", Util: &util, MemUsed: &used, MemTotal: &total,
-		}}}))
-		c := a.fleetCanvas()
-		axis := -1
-		for y := 1; y < a.boardTop-1 && axis < 0; y++ {
-			for x := 1; x < a.width/2; x++ {
-				if cl := c.at(x, y); cl != nil && cl.Text == "─" {
-					axis = y
-					break
-				}
+// TestSkylineBarsWalkTheirRamp: a full bar crosses its metric's ramp from the
+// axis outward, half a cell at a time, and the two metrics stay apart.
+//
+// The bars were once one colour per row, which read as three stripes, and then
+// one flat colour per metric, which read as no gradient at all. A full bar now
+// shows twice as many shades as it has rows, each lighter than the one nearer
+// the names, and its tip is the top of the ramp.
+func TestSkylineBarsWalkTheirRamp(t *testing.T) {
+	a := skyFleet(200, []skyHost{{"lab-a", 2, 100, 1}})
+	c := a.fleetCanvas()
+	axis := skyAxis(t, c, a.boardTop)
+	col := -1
+	for x := 0; x < c.W/2 && col < 0; x++ {
+		if inSkyHost(a, x, axis) && c.at(x, axis-1).Text == "▄" {
+			col = x
+		}
+	}
+	if col < 0 {
+		t.Fatal("no full utilisation bar drawn")
+	}
+	// Walk away from the axis, half a cell at a time: lower half then upper.
+	var util, vram []theme.RGB
+	for y := axis - 1; y > 0 && c.at(col, y).Text == "▄"; y-- {
+		util = append(util, c.at(col, y).FG, c.at(col, y).BG)
+	}
+	for y := axis + 1; y < a.boardTop && c.at(col, y).Text == "▀"; y++ {
+		vram = append(vram, c.at(col, y).FG, c.at(col, y).BG)
+	}
+	for name, run := range map[string][]theme.RGB{"util": util, "vram": vram} {
+		if len(run) < 4 {
+			t.Fatalf("%s: a full bar is only %d half-cells", name, len(run))
+		}
+		for i := 1; i < len(run); i++ {
+			l0, _, _ := theme.OKLCHOf(run[i-1])
+			l1, _, _ := theme.OKLCHOf(run[i])
+			if l1 <= l0 {
+				t.Errorf("%s: half-cell %d (%s) is not lighter than the one nearer the axis (%s)", name, i, run[i].Hex(), run[i-1].Hex())
 			}
 		}
-		out := map[string]map[theme.RGB]bool{"util": {}, "vram": {}}
-		for y := 1; y < a.boardTop-1; y++ {
-			for x := 1; x < a.width/2; x++ {
-				cl := c.at(x, y)
-				if cl == nil {
-					continue
-				}
-				switch cl.Text {
-				case "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█":
-					if y < axis {
-						out["util"][cl.FG] = true
-					} else {
-						out["vram"][cl.FG] = true
-					}
-				}
-			}
-		}
-		return out
-	}
-	seen := read(37, 55)
-	for name, colours := range seen {
-		if len(colours) == 0 {
-			continue
-		}
-		if len(colours) != 1 {
-			t.Errorf("%s bars show %d colours, want one", name, len(colours))
+		if d := theme.DeltaE(run[0], run[len(run)-1]); d < 10 {
+			t.Errorf("%s: the bar's two ends are only ΔE %.1f apart; the gradient does not show", name, d)
 		}
 	}
-	// The one colour is the metric's, and the two metrics differ.
-	var u, v theme.RGB
-	for c := range seen["util"] {
-		u = c
+	if tip := util[len(util)-1]; tip != a.skin.Scale.CPU.AtFraction(1) {
+		t.Errorf("a full util bar ends at %s, want the ramp's top %s", tip.Hex(), a.skin.Scale.CPU.AtFraction(1).Hex())
 	}
-	for c := range seen["vram"] {
-		v = c
-	}
-	if theme.DeltaE(u, v) < 10 {
-		t.Errorf("util %s and vram %s bars are too close", u.Hex(), v.Hex())
+	// The two metrics are told apart at every height.
+	for i := range min(len(util), len(vram)) {
+		if theme.DeltaE(util[i], vram[i]) < 10 {
+			t.Errorf("half-cell %d: util %s and vram %s are too close", i, util[i].Hex(), vram[i].Hex())
+		}
 	}
 }
 

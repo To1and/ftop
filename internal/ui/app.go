@@ -57,6 +57,11 @@ type hostState struct {
 	// unsupported says the probe cannot run on this host's platform (macOS,
 	// Windows, anything that is not Linux x86_64).
 	unsupported bool
+	// seq counts the samples applied. Every history grows only when it moves,
+	// so a graph drawn at one seq is the same picture until the next.
+	seq int
+	// graphs holds each history's last drawn graph (graphOf).
+	graphs map[string]*graphMemo
 }
 
 // invSlot is one device in a host's inventory.
@@ -174,6 +179,27 @@ type App struct {
 	// field read under a.mu because tickPeriod runs on the program's own goroutine
 	// and must not be able to block on the render lock.
 	anyHeld atomic.Bool
+	// changed is when a sample last landed (Unix nanoseconds), so the tick knows
+	// a bar may be gliding; an atomic for the same reason as anyHeld.
+	changed atomic.Int64
+	// glideUntil is when the latest-ending glide ends (Unix nanoseconds).
+	glideUntil atomic.Int64
+	// animate is set once the program is running: only then do bars glide.
+	animate bool
+	// glides is each bar's move to its latest reading, keyed by the bar.
+	glides map[barID]*glide
+	// tickGen numbers the tick chain; a tick from an older chain is dropped, so
+	// hurrying the clock never leaves two chains running. chainRate is the rate
+	// the live chain was last scheduled at.
+	tickGen   int
+	chainRate tickRate
+	// spinStep is the interval at which some lamp on the board next changes
+	// frame (nanoseconds; 0 when none is turning), kept by refreshSpin.
+	spinStep atomic.Int64
+	// hold says this message's frame waits for the next tick, and held is the
+	// frame shown meanwhile (see Update).
+	hold bool
+	held tea.View
 	// now is the clock the render reads for anything time-varying, and the only
 	// one it may read: a draw that called time.Now() itself would make -once and
 	// PlainFrame non-deterministic, and would make a lamp's breath jump whenever a
@@ -252,33 +278,89 @@ func New(opts Options) *App {
 	return a
 }
 
-// Init starts the clock.
+// Init starts the clock, and with it the animation: a running board glides its
+// bars, where a snapshot draws them at their readings.
 func (a *App) Init() tea.Cmd {
-	return tea.Batch(tea.Tick(a.tickPeriod(), func(t time.Time) tea.Msg { return tickMsg(t) }))
+	a.animate = true
+	return a.tick()
 }
 
-// lampFPS is the lamp's frame rate while any card is held.
-//
-// 8 is chosen from what the eye needs to read a slow breath rather than from what
-// the renderer can afford: a full frame costs ~0.9 ms, so 8 Hz is under 1% of a
-// core, and Bubble Tea's renderer diffs the screen buffer, so the terminal only
-// receives the lamp's cells changing. A higher rate would spend a multiple of that
-// to say the same thing.
-const lampFPS = 8
+// tick schedules the next repaint on the live chain.
+func (a *App) tick() tea.Cmd {
+	gen, d := a.tickGen, a.tickPeriod()
+	a.chainRate = a.tickRate()
+	return tea.Tick(d, func(t time.Time) tea.Msg { return tickMsg{t, gen} })
+}
 
-// tickPeriod is how often to repaint: the lamp's period while something is held,
-// one second otherwise.
+// hurry starts a faster chain when something has just started to move, rather
+// than letting the live one finish its wait first: a bar whose glide began
+// between two slow ticks would otherwise sit at its old length for most of a
+// second and then appear at the new one, which is the jump the glide is for. The
+// same holds between a lamp's step and the frame rate.
+func (a *App) hurry() tea.Cmd {
+	if a.tickRate() <= a.chainRate {
+		return nil
+	}
+	a.tickGen++
+	return a.tick()
+}
+
+// tickRate is how fast the board needs repainting.
+type tickRate int
+
+const (
+	rateRest  tickRate = iota // once a second: the clock and "N s ago"
+	rateSpin                  // on a turning lamp's steps
+	rateFrame                 // the frame rate: a bar is gliding
+)
+
+// tickRate is the frame rate while the board is on screen and a bar on it is
+// moving, a lamp's step while one is turning, at rest otherwise. A host view has
+// neither lamps nor gliding bars, so it never needs either.
 //
 // The answer comes from an atomic flag set where the holders are, not from taking
 // a.mu. This runs on the Bubble Tea goroutine between frames, and the one thing it
 // must never do is block on the render lock: a lock-free read here means the frame
 // rate cannot deadlock against a draw, and the cost of being at most one message
 // stale is a single repaint at the old period.
+func (a *App) tickRate() tickRate {
+	switch {
+	case !a.boardShown():
+		return rateRest
+	case a.moving():
+		return rateFrame
+	case a.spinStep.Load() > 0:
+		return rateSpin
+	}
+	return rateRest
+}
+
+// tickPeriod is how long until the next repaint at the rate the board needs.
 func (a *App) tickPeriod() time.Duration {
-	if a.anyHeld.Load() {
-		return time.Second / lampFPS
+	switch a.tickRate() {
+	case rateFrame:
+		return time.Second / frameRate
+	case rateSpin:
+		// Only lamps are moving: wake when one of them next changes frame, and
+		// not in between, where every frame would be the one before. A spinner
+		// whose frames land on the frame rate's grid instead of its own would
+		// also step unevenly, a frame early here and late there.
+		step := time.Duration(a.spinStep.Load())
+		d := step - time.Duration(time.Now().UnixNano()%int64(step))
+		if d < step/4 {
+			d += step
+		}
+		return d
 	}
 	return time.Second
+}
+
+// boardShown says whether the frame is the board, alone or under the help or
+// the settings panel, both of which are drawn over it. The view flags are read
+// here without the lock: they are written only by Update, on the goroutine that
+// also calls this.
+func (a *App) boardShown() bool {
+	return a.help || a.settings || !(a.detail || a.procView)
 }
 
 // clock returns the moment the current frame is drawn at.
@@ -286,16 +368,19 @@ func (a *App) tickPeriod() time.Duration {
 // A zero a.now means no message has been delivered yet, which is the -once and
 // demo path: those print a snapshot rather than run a program, and a snapshot must
 // not depend on when the process happened to start. So they get a fixed phase —
-// the bright end of the breath — and two runs of `ftop -once` on two machines
-// produce the same bytes.
+// snapshotAt, mid-turn for every spinner — and two runs of `ftop -once` on two
+// machines produce the same bytes.
 func (a *App) clock() time.Time {
 	if a.now.IsZero() {
-		return time.Unix(0, 0).Add(lampBreath / 2)
+		return time.Unix(0, 0).Add(snapshotAt)
 	}
 	return a.now
 }
 
-type tickMsg time.Time
+type tickMsg struct {
+	at  time.Time
+	gen int
+}
 
 // Update handles every message.
 func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -303,8 +388,13 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// is the only place the frame's notion of "now" is set: draw code reads it and
 	// never the real clock, which is what keeps the lamp's breath a function of the
 	// frame's timestamp rather than of how fast the messages happened to arrive.
+	// A sample or a ledger read while the clock is running fast is drawn by the
+	// next tick, at most a frame away, rather than on arrival: a fleet's hosts
+	// report out of step, and a repaint per arrival was a quarter of all the
+	// frames drawn, each a full one, to show what the next tick shows anyway.
+	a.hold = false
 	if t, ok := msg.(tickMsg); ok {
-		a.now = time.Time(t)
+		a.now = t.at
 	} else {
 		a.now = time.Now()
 	}
@@ -314,10 +404,14 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case tea.KeyPressMsg:
-		return a.press(m.String())
+		// A key can bring the board back on screen, so it may need the clock
+		// brought up to the frame rate with it.
+		m2, cmd := a.press(m.String())
+		return m2, tea.Batch(cmd, a.hurry())
 
 	case tea.MouseClickMsg:
-		return a.click(m.Mouse())
+		m2, cmd := a.click(m.Mouse())
+		return m2, tea.Batch(cmd, a.hurry())
 
 	case tea.MouseWheelMsg:
 		a.wheel(m.Mouse())
@@ -325,15 +419,21 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tickMsg:
 		// A repaint even with no new data keeps the freshness glyph, the "N
-		// seconds ago" reading and the holders' lamp honest. The period is the
-		// lamp's: with somebody holding a card the board redraws at the lamp's
-		// frame rate, and with nothing held it falls back to one second, because
-		// there is then nothing to animate.
-		return a, tea.Tick(a.tickPeriod(), func(t time.Time) tea.Msg { return tickMsg(t) })
+		// seconds ago" reading and the holders' lamp honest. While a lamp is lit
+		// or a bar is gliding the board redraws at the frame rate; at rest it
+		// falls back to one second, because there is then nothing to animate.
+		// A tick from a chain that hurry replaced is dropped here, which is what
+		// ends that chain.
+		if m.gen != a.tickGen {
+			return a, nil
+		}
+		return a, a.tick()
 
 	case sshx.SampleMsg:
 		a.applySample(m)
-		return a, nil
+		cmd := a.hurry()
+		a.hold = a.chainRate == rateFrame
+		return a, cmd
 
 	case sshx.ErrMsg:
 		a.applyErr(m)
@@ -341,7 +441,9 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case LedgerMsg:
 		a.applyLedger(m)
-		return a, nil
+		cmd := a.hurry()
+		a.hold = a.chainRate == rateFrame
+		return a, cmd
 	}
 	return a, nil
 }
@@ -360,6 +462,9 @@ func (a *App) applySample(m sshx.SampleMsg) {
 	st.noGPU = len(st.sample.Gpus) == 0
 	st.unsupported = false
 	st.age = time.Now()
+	st.seq++
+	a.changed.Store(st.age.UnixNano())
+	defer a.refreshSpin()
 	// No readable card is a gap in the host's history, not a 0% second.
 	avg := math.NaN()
 	if m.Sample.KnownGPUs() > 0 {
@@ -870,6 +975,10 @@ func (a *App) View() tea.View {
 		// is held: the board never needs to track a hovering pointer.
 		v.MouseMode = tea.MouseModeCellMotion
 	}
+	if a.hold && a.held.Content != "" {
+		return a.held
+	}
+	defer func() { a.held = v }()
 	if a.settings {
 		v.Content = a.settingsCanvas().ANSI()
 	} else if a.help {

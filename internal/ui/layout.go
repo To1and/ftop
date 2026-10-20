@@ -365,7 +365,7 @@ func hostPlan(geo rowGeom, inner int) hostGeom {
 // "cpu" and "mem" are written on the lines themselves, each in its own ramp.
 // In the bottom border, one word would name a host reading and a card reading
 // at once ("util·cpu"), two scopes in one noun.
-func hostBlock(c *Canvas, x, y int, h *hostState, s *theme.Skin, g hostGeom) {
+func hostBlock(c *Canvas, x, y int, h *hostState, s *theme.Skin, g hostGeom, gl glider) {
 	t := s.Theme
 	snap := h.sample
 	meter := func(row int, name string, labFG theme.RGB, pct float64, sc theme.RGBScale) {
@@ -378,10 +378,9 @@ func hostBlock(c *Canvas, x, y int, h *hostState, s *theme.Skin, g hostGeom) {
 			c.Text(px, ly, "—", t.C("inactive_fg"))
 			return
 		}
+		shown := int(math.Round(gl.to(barID{host: h.name, metric: name}, pct)))
 		v := int(math.Round(pct))
-		for i, cell := range meterScale(g.meterW, v, sc, t) {
-			c.PutCell(x+g.barX+i, ly, cell)
-		}
+		putMeter(c, x+g.barX, ly, g.meterW, shown, v, sc, t)
 		writePct(c, px, ly, v, sc.At(float64(v)), t)
 	}
 	// reading writes the first of its forms that fits the line whole, the number
@@ -434,7 +433,7 @@ func hostBlock(c *Canvas, x, y int, h *hostState, s *theme.Skin, g hostGeom) {
 	// machine that has reported 0%, so an idle host draws a line rather than
 	// nothing.
 	if g.graphW > 0 {
-		rows := theme.Graph(t, h.cpuHist, g.graphW, hostRows, "", theme.GraphOpts{NoZero: true, Scale: &s.Scale.HostCPU})
+		rows := h.graphOf("\x00cpu", h.cpuHist, g.graphW, hostRows, &s.Scale.HostCPU, t)
 		for r := range rows {
 			for i, cell := range rows[r] {
 				c.Put(x+g.graphX+i, y+r, cell.Text, cell.FG)
@@ -470,7 +469,7 @@ func idxWidth(hosts []*hostState) int {
 // Both bars share the row instead of stacking. Stacking cost two lines per GPU,
 // which is why a 50-row terminal used to hold six hosts; side by side, with each
 // bar in its own gradient, "busy but VRAM-light" is still a visible shape.
-func gpuLine(c *Canvas, x, y int, g wire.Gpu, hist []float64, s *theme.Skin, geo rowGeom, buf []theme.Cell, st lampState, now time.Time) {
+func gpuLine(c *Canvas, x, y int, g wire.Gpu, graph func(w, h int) [][]theme.Cell, s *theme.Skin, geo rowGeom, buf []theme.Cell, st lampState, now time.Time, host string, gl glider) {
 	t := s.Theme
 	c.Text(x, y, fitExact(fmt.Sprint(g.Index), geo.idxW), t.C("graph_text"))
 	// The lamp takes a cell that is blank on the layout in use, and never one that
@@ -506,10 +505,10 @@ func gpuLine(c *Canvas, x, y int, g wire.Gpu, hist []float64, s *theme.Skin, geo
 			c.Text(px, by, "—", t.C("inactive_fg"))
 			return
 		}
+		// The bar glides to the reading; the number is the reading.
+		shown := int(math.Round(gl.to(barKey(host, g, name), pct)))
 		v := int(math.Round(pct))
-		for i, cell := range meterScale(geo.meterW, v, scale, t) {
-			c.PutCell(bx+i, by, cell)
-		}
+		putMeter(c, bx, by, geo.meterW, shown, v, scale, t)
 		writePct(c, px, by, v, scale.At(float64(v)), t)
 	}
 	mem := g.MemPct()
@@ -582,7 +581,7 @@ func gpuLine(c *Canvas, x, y int, g wire.Gpu, hist []float64, s *theme.Skin, geo
 		// NoZero keeps a floor under an idle card, so "measured 0%" draws a line
 		// and only "no samples yet" is blank. On two lines the graph is two rows
 		// tall and shades by height like a host's own.
-		rows := theme.Graph(t, hist, geo.graphW, geo.rows, "", theme.GraphOpts{NoZero: true, Scale: &s.Scale.CPU})
+		rows := graph(geo.graphW, geo.rows)
 		for r := range rows {
 			for i, cell := range rows[r] {
 				c.Put(x+geo.graphX()+i, y+r, cell.Text, cell.FG)
@@ -657,6 +656,7 @@ type notch struct {
 // cardStyle is what every card on a board shares besides its row plan.
 type cardStyle struct {
 	interval time.Duration // between samples, for the graph's span
+	glide    glider        // a bar's drawn length for its reading
 }
 
 // borderLegend names the row's columns in each card's bottom border, under the
@@ -867,7 +867,7 @@ func hostCard(c *Canvas, p placed, s *theme.Skin, geo rowGeom, cs cardStyle, foc
 	// GPU, plain, does not run on from it as one block of four lines, and every
 	// GPU keeps the band it had.
 	c.FillRect(p.x+1, first, p.w-2, hostRows, band)
-	hostBlock(c, x0, first, h, s, hp)
+	hostBlock(c, x0, first, h, s, hp, cs.glide)
 	for i, g := range h.sample.Gpus {
 		gy := first + hostRows + i*geo.rows
 		if i%2 == 1 {
@@ -880,8 +880,10 @@ func hostCard(c *Canvas, p placed, s *theme.Skin, geo rowGeom, cs cardStyle, foc
 		// lamp treats as "not busy" rather than as idle.
 		hv, held := holders[ledgerKey(h.name, g)]
 		util := g.UtilPct()
-		gpuLine(c, x0, gy, g, h.gpuHist[gpuKey(g)], s, geo, buf,
-			lampFor(hv, held, wireGPU{util: util}), now)
+		key := gpuKey(g)
+		graph := func(w, rows int) [][]theme.Cell { return h.graphOf(key, h.gpuHist[key], w, rows, &s.Scale.CPU, t) }
+		gpuLine(c, x0, gy, g, graph, s, geo, buf,
+			lampFor(hv, held, wireGPU{util: util}), now, h.name, cs.glide)
 	}
 }
 
@@ -923,26 +925,49 @@ func fitExact(txt string, w int) string {
 // A one-cell bar is necessarily one colour: there is nowhere to interpolate.
 func meterScale(width, value int, sc theme.RGBScale, t *theme.Theme) []theme.Cell {
 	out := make([]theme.Cell, width)
-	on := (value*width + 50) / 100 // the filled cells, rounded
-	top := float64(value) / 100
 	for i := range out {
-		if i < on {
-			// Where this cell sits between the ramp's start and the reading.
-			var f float64
-			if on > 1 {
-				f = float64(i) / float64(on-1)
-			} else {
-				f = 1
-			}
-			out[i] = theme.Cell{Text: "■", FG: sc.AtFraction(top * f)}
-			continue
-		}
-		// The rest of the bar is a track, not a colour: darker than the meter
-		// background, so a row of empty cells does not read as a grey bar of its
-		// own beside the values.
-		out[i] = theme.Cell{Text: "■", FG: t.Track(), Dim: true}
+		out[i] = meterCell(i, width, value, value, sc, t)
 	}
 	return out
+}
+
+// putMeter draws a meter straight onto the canvas: shown cells' worth of length,
+// coloured for the reading. At the frame rate the slice meterScale returns was a
+// quarter of everything a frame allocated.
+//
+// The two differ only while the bar glides, and they are separate so that a
+// glide moves the bar's end and nothing else. Coloured for the length drawn, every
+// cell of the bar took a new shade in every frame of the move — the whole bar
+// rewritten thirty times a second, which was most of what the terminal was sent.
+func putMeter(c *Canvas, x, y, width, shown, value int, sc theme.RGBScale, t *theme.Theme) {
+	for i := 0; i < width; i++ {
+		c.PutCell(x+i, y, meterCell(i, width, shown, value, sc, t))
+	}
+}
+
+// meterCell is cell i of a width-cell meter drawn shown long and coloured for
+// value: the cells up to the reading walk the ramp from its start to the
+// reading's colour, and any drawn past it (a bar still shrinking to the reading)
+// take the colour of their own position, which carries on lighter.
+func meterCell(i, width, shown, value int, sc theme.RGBScale, t *theme.Theme) theme.Cell {
+	if i < (shown*width+50)/100 {
+		on := (value*width + 50) / 100 // the reading's filled cells, rounded
+		var f float64
+		switch {
+		case i >= on && width > 1:
+			f = float64(i) / float64(width-1)
+		case on > 1:
+			// Where this cell sits between the ramp's start and the reading.
+			f = float64(value) / 100 * float64(i) / float64(on-1)
+		default:
+			f = float64(value) / 100
+		}
+		return theme.Cell{Text: "■", FG: sc.AtFraction(f)}
+	}
+	// The rest of the bar is a track, not a colour: darker than the meter
+	// background, so a row of empty cells does not read as a grey bar of its
+	// own beside the values.
+	return theme.Cell{Text: "■", FG: t.Track(), Dim: true}
 }
 
 // writePct writes "59%" in fg, the sign dimmer than the digits. The sign is part

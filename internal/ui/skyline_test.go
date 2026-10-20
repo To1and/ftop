@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"ftop/internal/theme"
 	"ftop/internal/wire"
 )
 
@@ -146,17 +147,18 @@ func TestSkylineBarsStartAtTheNameRow(t *testing.T) {
 					continue
 				}
 				found = true
+				onUtil, onVRAM := skyRamp(a.skin.Scale.CPU), skyRamp(a.skin.Scale.VRAM)
 				// The cell above the names is coloured at its bottom edge.
 				switch {
-				case lower[up.Text] && up.FG == skyUtil:
-				case up.Text == "▄" && up.FG == skyUtil && up.HasBG && up.BG == skyUtil:
+				case lower[up.Text] && onUtil[up.FG]:
+				case up.Text == "▄" && onUtil[up.FG] && up.HasBG && onUtil[up.BG]:
 				default:
 					t.Errorf("util %.0f%%: the bar does not stand on the names at column %d: %q fg %s", util, x, up.Text, up.FG.Hex())
 				}
 				// The cell below them is coloured at its top edge.
 				switch {
-				case down.Text == "▀" && down.FG == skyVRAM:
-				case lower[down.Text] && down.FG == a.skin.Bg && down.HasBG && down.BG == skyVRAM:
+				case down.Text == "▀" && onVRAM[down.FG]:
+				case lower[down.Text] && down.FG == a.skin.Bg && down.HasBG && onVRAM[down.BG]:
 				default:
 					t.Errorf("vram %.1f%%: the bar does not hang from the names at column %d: %q fg %s bg %s",
 						vram*100, x, down.Text, down.FG.Hex(), down.BG.Hex())
@@ -167,6 +169,18 @@ func TestSkylineBarsStartAtTheNameRow(t *testing.T) {
 			}
 		}
 	}
+}
+
+// skyRamp is every colour a skyline bar of this metric can take: its ramp at each
+// eighth of a cell on a chart half up to four rows tall.
+func skyRamp(sc theme.RGBScale) map[theme.RGB]bool {
+	out := map[theme.RGB]bool{}
+	for full := 8; full <= 32; full += 8 {
+		for e := 0; e <= full; e++ {
+			out[skyShade(sc, e, full)] = true
+		}
+	}
+	return out
 }
 
 // inSkyHost reports whether column x of row y is inside a host's stretch of the

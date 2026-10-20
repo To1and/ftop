@@ -199,10 +199,12 @@ func (a *App) meterRow(c *Canvas, x, y int, label string, labelW, meterW int, pc
 	if pct < 0 {
 		c.Text(px, y, "—", t.C("inactive_fg"))
 	} else {
-		v := int(math.Round(pct))
-		for i, cell := range (theme.Meter{Width: meterW, Scale: &scale}).Render(t, v) {
+		// The bar glides to the reading; the number is the reading.
+		shown := int(math.Round(a.glideTo(barID{metric: label}, pct)))
+		for i, cell := range (theme.Meter{Width: meterW, Scale: &scale}).Render(t, shown) {
 			c.PutCell(cx+i, y, cell)
 		}
+		v := int(math.Round(pct))
 		writePct(c, px, y, v, scale.At(float64(v)), t)
 	}
 	cx = px + pctW
@@ -392,15 +394,21 @@ func (a *App) headerSkyline(c *Canvas, x, y, w int, fs fleetStats) int {
 	return by + h
 }
 
-// The skyline's two bar colours. A bar's height is its reading, so the colour
-// only has to say which metric the bar belongs to; taking it from the ramp at a
-// fixed point keeps every bar of a metric identical.
-// They are taken at the middle of each ramp, where the colour is at its most
-// legible on the page background.
-var (
-	skyUtil = theme.Default.G("util", 62)
-	skyVRAM = theme.Default.G("vram", 62)
-)
+// skyShade is a skyline bar's colour at a height: the metric's ramp at the
+// fraction of the chart's half that lies between the axis and that edge.
+//
+// The colour is a function of the position, not of the bar: every bar of a metric
+// is the same colour at the same height, and a bar's tip is the colour of its own
+// reading. That is the gradient the card meters draw — from the ramp's start to
+// the reading — stood on end. A tall bar walks the whole ramp, a short one stays
+// in its dark end, and the comparison between hosts is in the colour as well as
+// in the height.
+//
+// Sampled at the edge furthest from the axis, so the last half-cell of a full
+// bar is the ramp's top and the first is one half-cell's step above its start.
+func skyShade(sc theme.RGBScale, edge, full int) theme.RGB {
+	return sc.AtFraction(float64(edge) / float64(full))
+}
 
 // skyline draws the bar chart into the w×h area at (x, y): h-1 rows split evenly
 // above and below an axis row.
@@ -500,8 +508,13 @@ func (a *App) skyline(c *Canvas, x, y, w, h int) {
 	// that also reports a host's own cpu and memory a few rows down: the pairs
 	// read as the same two quantities at two scopes, when this chart is devices
 	// and the host's figures are the machine's.
-	c.Text(start-1-keyW, axis-1, "util", s.Scale.CPU.At(60))
-	c.Text(start-1-keyW, axis+1, "vram", s.Scale.VRAM.At(75))
+	//
+	// Each key sits a row clear of the noun, in the middle of the half it names:
+	// two rows up for utilisation and two down for VRAM. Stacked on three
+	// consecutive rows the three words read as one block of text, a list, rather
+	// than as a heading over the bars and a heading under them.
+	c.Text(start-1-keyW, axis-min(2, up), "util", s.Scale.CPU.At(60))
+	c.Text(start-1-keyW, axis+min(2, down), "vram", s.Scale.VRAM.At(75))
 	// "gpu" sits between the two keys, on the axis row, in the margin to the left
 	// of the chart rather than over it: the host names start at `start` and the
 	// three cells before them are empty on every chart wide enough to draw. The
@@ -539,7 +552,8 @@ func (a *App) skyline(c *Canvas, x, y, w, h int) {
 		default:
 			for j, gpu := range st.sample.Gpus {
 				cx := bx + j*slot
-				u := gpu.UtilPct()
+				// The bars glide, under the same keys as the card's meters.
+				u := a.glideTo(barKey(st.name, gpu, "util"), gpu.UtilPct())
 				if u < 0 {
 					// Unknown is a mark of its own, never an empty bar.
 					for k := 0; k < bar; k++ {
@@ -555,26 +569,29 @@ func (a *App) skyline(c *Canvas, x, y, w, h int) {
 					// presence is still on the board: its VRAM bar always hangs at
 					// least half a cell.
 					eighths := int(math.Round(u / 100 * float64(up*8)))
-					// One bar, one colour, and the same colour for every bar of
-					// this metric: the height is the reading, so tinting by the
-					// reading too says it twice and turns the chart into a field
-					// that fades to near-white at the top. Colour here identifies
-					// the metric — green is utilisation, blue is memory — and
-					// nothing else. Shading a three-cell bar along its height was
-					// banding, not a gradient: three shades of one hue stacked in
-					// a one-cell-wide column.
-					col := skyUtil
+					// The bar walks its ramp from the axis up (skyShade), in half
+					// cells: a full cell is two colours, the lower half in the
+					// glyph and the upper half behind it, so a three-row bar
+					// crosses six shades rather than three. Three was what an
+					// earlier pass drew, one colour per row, and it read as
+					// stripes; it was replaced by a single flat colour, which
+					// read as no gradient at all.
 					for r := 0; r < up; r++ {
-						n := min(max(eighths-(up-1-r)*8, 0), 8)
+						base := (up - 1 - r) * 8 // eighths between the axis and this cell
+						n := min(max(eighths-base, 0), 8)
 						if n == 0 {
 							continue
 						}
-						lo, hi := col, col
+						// A partial cell has one colour: the lower block glyph is
+						// the bar and the rest of the cell is page.
+						lo := skyShade(s.Scale.CPU, base+n, up*8)
+						hi := lo
 						glyph, two := blocks[n], false
 						if n == 8 {
 							// Bars grow upward: ▄ puts the lower half's colour in
 							// the glyph and the upper half's behind it.
 							glyph, two = "▄", true
+							lo = skyShade(s.Scale.CPU, base+4, up*8)
 						}
 						for k := 0; k < bar; k++ {
 							c.Put(cx+k, y+r, glyph, lo)
@@ -585,6 +602,9 @@ func (a *App) skyline(c *Canvas, x, y, w, h int) {
 					}
 				}
 				m := gpu.MemPct()
+				if m >= 0 {
+					m = a.glideTo(barKey(st.name, gpu, "vram"), m*100) / 100
+				}
 				if m < 0 {
 					// Unknown VRAM has a mark of its own under the axis: drawing
 					// nothing would read as a card using none.
@@ -614,14 +634,16 @@ func (a *App) skyline(c *Canvas, x, y, w, h int) {
 				if eighths < 4 {
 					eighths = 4
 				}
-				vcol := skyVRAM
+				// The same walk as utilisation, mirrored: the ramp runs from the
+				// axis down, so a bar's lowest edge is its reading's colour.
 				for r := 0; r < down; r++ {
 					n := min(max(eighths-r*8, 0), 8)
+					vcol := skyShade(s.Scale.VRAM, r*8+n, down*8)
 					for k := 0; k < bar && n > 0; k++ {
 						if n == 8 {
 							// ▀ puts the upper half in the glyph and the lower half
-							// behind it; both halves are the bar's colour.
-							c.Put(cx+k, axis+1+r, "▀", vcol)
+							// behind it, each in its own shade.
+							c.Put(cx+k, axis+1+r, "▀", skyShade(s.Scale.VRAM, r*8+4, down*8))
 							c.Fill(cx+k, axis+1+r, 1, vcol)
 							continue
 						}

@@ -1,7 +1,9 @@
 package ui
 
 import (
+	"bytes"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"ftop/internal/theme"
@@ -34,6 +36,11 @@ type Cell struct {
 type Canvas struct {
 	W, H  int
 	cells []Cell
+	ansi  []byte // ANSI's buffer, kept between frames
+	// last and lastANSI are the previous frame's bytes and the string made from
+	// them: a frame identical to the one before returns the same string.
+	last     []byte
+	lastANSI string
 }
 
 // Reset reuses a canvas for a new frame of the same geometry.
@@ -259,15 +266,18 @@ func (c *Canvas) BoxFooter(x, y, w, h int, fg theme.RGB, text string) int {
 // brings it to ~40 KB. Bubble Tea diffs per cell, so the smaller string is also
 // faster to diff.
 func (c *Canvas) ANSI() string {
-	var b strings.Builder
-	b.Grow(c.W * c.H / 4)
+	// The bytes are built in a buffer the canvas keeps from frame to frame, with
+	// the numbers appended directly: through a strings.Builder and fmt this was
+	// half a megabyte of garbage and a tenth of the CPU at the frame rate, for a
+	// string the same size every time.
+	b := c.ansi[:0]
 
 	var curFG, curBG theme.RGB
 	var curBold, haveStyle bool
 
 	for y := 0; y < c.H; y++ {
 		if y > 0 {
-			b.WriteByte('\n')
+			b = append(b, '\n')
 		}
 		x := 0
 		for x < c.W {
@@ -291,19 +301,25 @@ func (c *Canvas) ANSI() string {
 			}
 			if haveStyle && cell.Bold != curBold {
 				if cell.Bold {
-					b.WriteString("\x1b[1m")
+					b = append(b, "\x1b[1m"...)
 				} else {
-					b.WriteString("\x1b[22m")
+					b = append(b, "\x1b[22m"...)
 				}
 				curBold = cell.Bold
 			}
 			if !haveStyle || cell.FG != curFG || cell.BG != curBG {
 				if !haveStyle && cell.Bold {
-					b.WriteString("\x1b[1m")
+					b = append(b, "\x1b[1m"...)
 					curBold = true
 				}
-				fmt.Fprintf(&b, "\x1b[38;2;%d;%d;%dm\x1b[48;2;%d;%d;%dm",
-					cell.FG.R, cell.FG.G, cell.FG.B, cell.BG.R, cell.BG.G, cell.BG.B)
+				// Only what changed: a run that differs from the last in one
+				// colour sets that colour alone. The terminal keeps the other.
+				if !haveStyle || cell.FG != curFG {
+					b = appendSGR(b, "\x1b[38;2;", cell.FG)
+				}
+				if !haveStyle || cell.BG != curBG {
+					b = appendSGR(b, "\x1b[48;2;", cell.BG)
+				}
 				curFG, curBG, haveStyle = cell.FG, cell.BG, true
 			}
 			for i := runStart; i < x; i++ {
@@ -312,15 +328,36 @@ func (c *Canvas) ANSI() string {
 					continue
 				}
 				if cl.Text == "" {
-					b.WriteByte(' ')
+					b = append(b, ' ')
 				} else {
-					b.WriteString(cl.Text)
+					b = append(b, cl.Text...)
 				}
 			}
 		}
 	}
-	b.WriteString("\x1b[0m")
-	return b.String()
+	b = append(b, "\x1b[0m"...)
+	// A frame like the last one is the last one's string, not a copy of it. At
+	// the frame rate most frames are unchanged between a spinner's steps, and
+	// the renderer recognises the very same string as no change without reading
+	// it, where a fresh copy would be compared byte by byte, or parsed.
+	if c.lastANSI != "" && bytes.Equal(b, c.last) {
+		c.ansi = b
+		return c.lastANSI
+	}
+	c.lastANSI = string(b)
+	c.ansi, c.last = c.last, b
+	return c.lastANSI
+}
+
+// appendSGR appends one truecolour escape: lead, then "r;g;bm".
+func appendSGR(b []byte, lead string, c theme.RGB) []byte {
+	b = append(b, lead...)
+	b = strconv.AppendInt(b, int64(c.R), 10)
+	b = append(b, ';')
+	b = strconv.AppendInt(b, int64(c.G), 10)
+	b = append(b, ';')
+	b = strconv.AppendInt(b, int64(c.B), 10)
+	return append(b, 'm')
 }
 
 // Blit copies a rectangular region of src into dst at (dx,dy).

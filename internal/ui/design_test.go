@@ -255,12 +255,12 @@ func TestUnknownReadingsInTheHeader(t *testing.T) {
 	nan, used := math.NaN(), uint64(50)
 	h := head([]wire.Gpu{{Index: 0, Name: "RTX 4090", Util: &nan, MemUsed: &used, MemTotal: &total}})
 	lines := strings.Split(h, "\n")
-	// The axis is per host now, so the row is found by the key above it rather
+	// The axis is per host now, so the row is found by the noun on it rather
 	// than by a rule running under the name.
 	axis := -1
 	for i, l := range lines {
-		if strings.Contains(l, "util") {
-			axis = i + 1
+		if strings.Contains(l, " gpu ") {
+			axis = i
 		}
 	}
 	if axis < 0 || !strings.Contains(strings.Join(lines[axis-1:axis], "\n"), "·") {
@@ -722,8 +722,8 @@ func TestSkylineSpacesHosts(t *testing.T) {
 }
 
 // TestSkylineKeysBesideTheAxis: the util and vram keys sit one each side of
-// the axis, a gap from the first host like the hosts from each other, and the
-// header has no title of its own.
+// the axis, each a row clear of the "gpu" between them, a gap from the first
+// host like the hosts from each other, and the header has no title of its own.
 func TestSkylineKeysBesideTheAxis(t *testing.T) {
 	for _, w := range []int{100, 160, 200, 240} {
 		a := fixture(w, 50, []int{8, 4, 2, 1})
@@ -749,7 +749,7 @@ func TestSkylineKeysBesideTheAxis(t *testing.T) {
 		for _, k := range []struct {
 			row  int
 			text string
-		}{{axis - 1, "util"}, {axis + 1, "vram"}} {
+		}{{axis - 2, "util"}, {axis + 2, "vram"}} {
 			i := strings.Index(lines[k.row], k.text)
 			if i < 0 {
 				t.Errorf("width %d: %q is not beside the axis: %q", w, k.text, lines[k.row])
@@ -758,6 +758,12 @@ func TestSkylineKeysBesideTheAxis(t *testing.T) {
 			end := len([]rune(lines[k.row][:i])) + len(k.text)
 			if first-end != 3 {
 				t.Errorf("width %d: %q is %d cells from the first host, want 3: %q", w, k.text, first-end, lines[k.row])
+			}
+		}
+		// The rows between the keys and the noun are blank in the key column.
+		for _, row := range []int{axis - 1, axis + 1} {
+			if key := string([]rune(lines[row])[:first]); strings.Contains(key, "util") || strings.Contains(key, "vram") {
+				t.Errorf("width %d: a key sits right against the axis: %q", w, lines[row])
 			}
 		}
 	}
