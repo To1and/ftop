@@ -103,9 +103,15 @@ set, the release waits until Apple has accepted the notarization.
 goreleaser release --snapshot --clean
 ```
 
-Signing and notarization are gated on `MACOS_SIGN_P12` being set, so a snapshot
-builds four unsigned archives and a cask under `dist/`. Everything except the
-upload and the tap commit can be checked this way.
+Signing and notarization run whenever `MACOS_SIGN_P12` is set, so with the
+secrets exported a snapshot produces four signed, notarized archives and a cask
+under `dist/` — everything except the upload and the tap commit. Without them it
+builds four unsigned archives, which is enough for the layout but proves nothing
+about Gatekeeper.
+
+The same run is available on CI: *Actions → release → Run workflow* with
+`snapshot` left on. It exercises the real secrets the way a tag will, and
+publishes nothing.
 
 ## Version
 
