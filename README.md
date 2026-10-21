@@ -383,10 +383,10 @@ make vet
   cards, workstation cards, Jetson) and a shade of it per model.
 - **A failed host leads with the reason.** `connection timed out` in the alert
   colour, the rest of the message dimmer after it.
-- **A host's view lists each card's top three processes** by memory and counts
-  the rest on the box's border: a card shared by sixteen workers no longer
-  takes half the screen. Every box keeps three process rows, so boxes side by
-  side line up and a job starting moves nothing.
+- **A host's view lists each card's top two processes** by memory, under a
+  dashed rule and a header, and counts the rest on the box's border: a card
+  shared by sixteen workers no longer takes half the screen. Every box keeps two
+  process rows, so boxes side by side line up and a job starting moves nothing.
 - **A held card names its thread, not its runtime.** The box's first line is the
   holding conversation's id in its runtime's colour, why, and since when; a card
   nobody holds says `free`, or `unclaimed` when something runs on it anyway.

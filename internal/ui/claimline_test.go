@@ -87,9 +87,9 @@ func TestClaimLineSaysFreeOrUnclaimed(t *testing.T) {
 	}
 }
 
-// TestDeviceBoxesAreOneHeight: every box keeps three process rows whatever is on
+// TestDeviceBoxesAreOneHeight: every box keeps two process rows whatever is on
 // its card, so an idle card beside a busy one lines up with it and a job starting
-// moves nothing; a fourth process is counted, not listed.
+// moves nothing; a third process is counted, not listed.
 func TestDeviceBoxesAreOneHeight(t *testing.T) {
 	a := fixtureWithUUIDs(200, 60, 2)
 	a.mu.Lock()
@@ -120,8 +120,8 @@ func TestDeviceBoxesAreOneHeight(t *testing.T) {
 	if len(heights) != 2 || heights[0] != heights[1] || heights[0] != detailBoxHeight {
 		t.Errorf("device boxes are %v rows tall, want both %d", heights, detailBoxHeight)
 	}
-	if frame := a.detailCanvas().Plain(); !strings.Contains(frame, "+2 more") {
-		t.Errorf("the processes past three are not counted:\n%s", frame)
+	if frame := a.detailCanvas().Plain(); !strings.Contains(frame, "+3 more") {
+		t.Errorf("the processes past two are not counted:\n%s", frame)
 	}
 }
 

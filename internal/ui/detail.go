@@ -19,9 +19,9 @@ import (
 // adds no precision, and the width is worth more as history.
 //
 // A device box is the same height whatever is on the card: its border, the claim
-// line, three gauges and three process rows. A box that grew with its process list
-// moved every box below it when a job started, and two boxes side by side stopped
-// lining up.
+// line, three gauges, the process table's rule and header, and two process rows. A
+// box that grew with its process list moved every box below it when a job started,
+// and two boxes side by side stopped lining up.
 const (
 	detailLabelW = 6  // "power "
 	detailBarW   = 14 // gauge length
@@ -100,14 +100,14 @@ func detailCols(gpus []wire.Gpu) []int {
 
 // maxProcs is how many of a device's processes a box lists, and how many rows it
 // keeps for them. A card belongs to a device, not to a job, so the list is what is
-// ON it: the top three by memory, the rest counted rather than listed. A list that
+// ON it: the top two by memory, the rest counted rather than listed. A list that
 // grew with the job turned one box into half the screen and squeezed every other
-// card off it.
-const maxProcs = 3
+// card off it; two rows hold the common cases, one job or a job and its helper.
+const maxProcs = 2
 
-// detailBoxHeight is a device box's height: border, the claim line, the gauges and
-// the process rows.
-const detailBoxHeight = 2 + 1 + detailGauges + maxProcs
+// detailBoxHeight is a device box's height: border, the claim line, the gauges,
+// the rule and header over the processes, and the process rows.
+const detailBoxHeight = 2 + 1 + detailGauges + 2 + maxProcs
 
 // detailCanvas draws one host's devices.
 //
@@ -669,10 +669,10 @@ func detailBox(c *Canvas, x, y, w, h int, g wire.Gpu, hist []float64, procs []wi
 		reading{v: fmtTemp(g.Temp), fg: tempFG},
 		reading{v: fmtFan(g.Fan), fg: value, follow: true})
 
-	// Process table columns. Its column names are in the bottom border under
-	// their columns, the way the board names its own: a header row of its own
-	// made every box a line taller and, on an idle card, was a row of names over
-	// nothing.
+	// Process table columns, named in a header row over them. A dashed rule above
+	// the header ends the gauges: without it the header read as a fourth gauge
+	// with no bar. The names were in the bottom border once, the way the board
+	// names its columns, but there they sat far below rows they named.
 	pidX := x0
 	userX := pidX + procPidW + detailGap
 	memX := userX + procUserW + detailGap
@@ -705,18 +705,23 @@ func detailBox(c *Canvas, x, y, w, h int, g wire.Gpu, hist []float64, procs []wi
 	if graphed {
 		c.legendLabel(gx, bottom, "util history", s)
 	}
+	for xx := x0; xx < cmdEnd; xx++ {
+		c.Put(xx, py, "┄", s.Hue.Frame)
+	}
+	py++
+	c.TextRight(pidX+procPidW, py, "Pid", label)
+	c.Text(userX, py, "User", label)
+	c.TextRight(memX+procMemW, py, "VRAM", label)
+	c.Text(cmdX, py, theme.Clip("Command", cmdEnd-cmdX), label)
+	py++
 	if len(procs) == 0 {
 		msg := "no processes"
 		if g.ProcsStale {
 			msg = "process list not sampled"
 		}
-		c.Text(x0, py, theme.Clip(msg, cmdEnd-x0), t.C("graph_text"))
+		c.Text(cmdX, py, theme.Clip(msg, cmdEnd-cmdX), t.C("graph_text"))
 		return
 	}
-	c.legendLabel(pidX+procPidW-len("pid"), bottom, "pid", s)
-	c.legendLabel(userX, bottom, "user", s)
-	c.legendLabel(memX+procMemW-len("vram"), bottom, "vram", s)
-	end := c.legendLabel(cmdX, bottom, "command", s)
 	list := procs
 	if len(list) > maxProcs {
 		list = list[:maxProcs]
@@ -741,11 +746,11 @@ func detailBox(c *Canvas, x, y, w, h int, g wire.Gpu, hist []float64, procs []wi
 		py++
 	}
 	if rest := len(procs) - len(list); rest > 0 {
-		// Say what is not shown, in the bottom border after the command column's
-		// name: a silently truncated list reads as a card with three jobs on it.
+		// Say what is not shown, in the bottom border under the commands: a
+		// silently truncated list reads as a card with two jobs on it.
 		more := fmt.Sprintf("+%d more", rest)
-		if x := end + 1; !graphed || x+theme.RuneWidth(more) < gx-1 {
-			c.lineLabel(x, bottom, more, t.C("graph_text"))
+		if !graphed || cmdX+theme.RuneWidth(more) < gx-1 {
+			c.lineLabel(cmdX, bottom, more, t.C("graph_text"))
 		}
 	}
 }
@@ -842,7 +847,7 @@ func dedupeProcs(ps []wire.Proc) []wire.Proc {
 		seen[p.PID] = struct{}{}
 		out = append(out, p)
 	}
-	// Biggest first, so the three a box lists are the three that matter. Ties go
+	// Biggest first, so the few a box lists are the ones that matter. Ties go
 	// to the lower pid, so a list of equal users does not reorder between samples.
 	sort.SliceStable(out, func(i, j int) bool {
 		if out[i].MemMB != out[j].MemMB {

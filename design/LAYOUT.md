@@ -135,11 +135,13 @@ on every card.
 Under it are the three gauges, each with the readings about the same thing:
 the compute clock and the link beside utilisation, used of total and the memory
 clock beside VRAM, the watts and the heat they make (`41°C fan 41%`) beside
-power. Then three process rows, always three, so every box is the same height
-and an idle card lines up with a busy one beside it; the top three by memory are
-listed and the rest counted (`+5 more`). The process columns are named in the
-bottom border (`pid ─ user ─ vram ─ command`), the way the board names its own,
-rather than in a header row.
+power. Then a dashed rule, a header row (`Pid  User  VRAM  Command`) and two
+process rows, always two, so every box is the same height and an idle card
+lines up with a busy one beside it; the top two by memory are listed and the
+rest counted in the bottom border (`+4 more`). The rule ends the gauges: without
+it the header read as a fourth gauge with no bar. The column names were in the
+bottom border for a while, the way the board names its own, but there they sat
+two empty rows below a single process and read as the box's footer.
 
 The device's history runs down the right side from the gauges to the box's
 bottom, so the graph's floor is the box's floor. The reading columns are as wide

@@ -660,7 +660,7 @@ func TestHostGraphReachesTheBoxBottom(t *testing.T) {
 	a := fixture(160, 40, []int{1})
 	a.mu.Lock()
 	st := a.states["hosta"]
-	// The box keeps three process rows whatever is on the card; three processes
+	// The box keeps two process rows whatever is on the card; three processes
 	// fill them, so the last row has a command to collide with the graph.
 	long := strings.Repeat("a-very-long-command-line ", 8)
 	st.sample.Gpus[0].Procs = []wire.Proc{{PID: 7, User: "z", Name: long, MemMB: 300}, {PID: 8, User: "z", Name: long, MemMB: 200}, {PID: 9, User: "z", Name: long, MemMB: 100}}

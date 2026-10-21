@@ -57,11 +57,16 @@ func TestDetailProcessRowsDoNotOverwriteVRAMBar(t *testing.T) {
 	if !strings.Contains(vramRow, "G/") && !strings.Contains(vramRow, "M/") {
 		t.Errorf("VRAM row lost its memory reading: %q", vramRow)
 	}
-	if procRow := rowText(c, boxTop+2+detailGauges); !strings.Contains(procRow, "4242") {
-		t.Errorf("first process line is not directly below the gauges: %q", procRow)
+	// Under the gauges: a dashed rule, the header naming the columns, then the
+	// processes.
+	if rule := rowText(c, boxTop+2+detailGauges); !strings.Contains(rule, "┄┄┄") {
+		t.Errorf("no rule between the gauges and the process table: %q", rule)
 	}
-	if foot := rowText(c, boxTop+detailBoxHeight-1); !strings.Contains(foot, " pid ") || !strings.Contains(foot, " command ") {
-		t.Errorf("the process columns are not named in the bottom border: %q", foot)
+	if head := rowText(c, boxTop+3+detailGauges); !strings.Contains(head, "Pid") || !strings.Contains(head, "Command") {
+		t.Errorf("the process columns are not named over them: %q", head)
+	}
+	if procRow := rowText(c, boxTop+4+detailGauges); !strings.Contains(procRow, "4242") {
+		t.Errorf("first process line is not directly below the header: %q", procRow)
 	}
 }
 

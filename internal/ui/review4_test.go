@@ -312,9 +312,9 @@ func TestFailedCardLeadsWithTheReason(t *testing.T) {
 	}
 }
 
-// TestHostViewListsTheTopThree: a device box lists its three biggest processes
-// and counts the rest, in its bottom border.
-func TestHostViewListsTheTopThree(t *testing.T) {
+// TestHostViewListsTheTopTwo: a device box lists its two biggest processes and
+// counts the rest, in its bottom border.
+func TestHostViewListsTheTopTwo(t *testing.T) {
 	a := fixture(200, 50, []int{1})
 	a.mu.Lock()
 	g := &a.states["hosta"].sample.Gpus[0]
@@ -324,21 +324,21 @@ func TestHostViewListsTheTopThree(t *testing.T) {
 	a.mu.Unlock()
 	a.open("hosta")
 	frame := a.detailCanvas().Plain()
-	order := []string{"1001", "1003", "1004"} // 900, 700, 500
+	order := []string{"1001", "1003"} // 900, 700
 	last := -1
 	for _, pid := range order {
 		i := strings.Index(frame, pid)
 		if i < 0 || i < last {
-			t.Fatalf("the top three are not listed largest first (%s):\n%s", pid, frame)
+			t.Fatalf("the top two are not listed largest first (%s):\n%s", pid, frame)
 		}
 		last = i
 	}
-	for _, pid := range []string{"1000", "1002", "1005"} {
+	for _, pid := range []string{"1000", "1002", "1004", "1005"} {
 		if strings.Contains(frame, pid) {
-			t.Errorf("process %s is listed beyond the top three", pid)
+			t.Errorf("process %s is listed beyond the top two", pid)
 		}
 	}
-	if !strings.Contains(frame, "+3 more") {
+	if !strings.Contains(frame, "+4 more") {
 		t.Errorf("the hidden processes are not counted:\n%s", frame)
 	}
 }
