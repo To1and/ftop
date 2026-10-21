@@ -3,6 +3,14 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # A run that signs and notarizes without publishing, so the pipeline can be
+  # exercised on a branch without going public.
+  workflow_dispatch:
+    inputs:
+      snapshot:
+        description: Build, sign and notarize without publishing
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -37,7 +45,7 @@ jobs:
       - uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
-          args: release --clean
+          args: release --clean ${{ inputs.snapshot && '--snapshot' || '' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # GITHUB_TOKEN can only write this repository; the tap is a second one,
