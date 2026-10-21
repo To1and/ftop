@@ -47,3 +47,32 @@ func TestProcBufferCapacity(t *testing.T) {
 		t.Errorf("process buffer holds %d entries; a busy multi-tenant host routinely exceeds 64", procBufCap)
 	}
 }
+
+// TestMemInfoV2Layout pins nvmlMemory_v2_t: a u32 version, four bytes of padding,
+// then total, reserved, free and used. A field at the wrong offset reads the
+// reservation as used memory, which is the bug v2 is here to fix.
+func TestMemInfoV2Layout(t *testing.T) {
+	if got := unsafe.Sizeof(memInfoV2{}); got != 40 {
+		t.Fatalf("memInfoV2 is %d bytes, want 40", got)
+	}
+	if memInfoV2Version != 0x02000028 {
+		t.Errorf("version = %#x, want 0x02000028 (nvmlMemory_v2)", memInfoV2Version)
+	}
+	var m memInfoV2
+	base := uintptr(unsafe.Pointer(&m))
+	for _, f := range []struct {
+		name string
+		p    unsafe.Pointer
+		want uintptr
+	}{
+		{"Version", unsafe.Pointer(&m.Version), 0},
+		{"Total", unsafe.Pointer(&m.Total), 8},
+		{"Reserved", unsafe.Pointer(&m.Reserved), 16},
+		{"Free", unsafe.Pointer(&m.Free), 24},
+		{"Used", unsafe.Pointer(&m.Used), 32},
+	} {
+		if off := uintptr(f.p) - base; off != f.want {
+			t.Errorf("%s at offset %d, want %d", f.name, off, f.want)
+		}
+	}
+}

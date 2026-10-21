@@ -304,3 +304,25 @@ func TestCheckTellsUnsupportedFromUnreachable(t *testing.T) {
 		}
 	}
 }
+
+// TestParseGpuReadsTheReservation: field 15 is the driver's reservation, kept apart
+// from used; a record without it (an older probe) leaves it unknown, not zero.
+func TestParseGpuReadsTheReservation(t *testing.T) {
+	f := []string{"G", "0", "GPU-abc", "NVIDIA GeForce RTX 4090", "0", "2", "24564",
+		"-", "-", "-", "-", "-", "-", "", "0", "457"}
+	g, _ := parseGpu(f)
+	if g.MemUsed == nil || *g.MemUsed != 2 {
+		t.Errorf("used = %v, want 2", g.MemUsed)
+	}
+	if g.MemReserved == nil || *g.MemReserved != 457 {
+		t.Errorf("reserved = %v, want 457", g.MemReserved)
+	}
+	old, _ := parseGpu(f[:15])
+	if old.MemReserved != nil {
+		t.Errorf("a record without field 15 decoded a reservation: %d", *old.MemReserved)
+	}
+	refused, _ := parseGpu(append(f[:15:15], "-"))
+	if refused.MemReserved != nil {
+		t.Error(`"-" decoded as a reservation`)
+	}
+}

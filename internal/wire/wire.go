@@ -40,15 +40,19 @@ type Gpu struct {
 	Util     *float64
 	MemUsed  *uint64 // MiB
 	MemTotal *uint64 // MiB
-	Temp     *float64
-	Power    *float64 // W
-	PowerCap *float64 // W
-	ClockSM  *float64 // MHz
-	ClockMem *float64 // MHz
-	Fan      *float64 // %
-	PcieGen  *int
-	PcieWide *int
-	Throttle uint64 // NVML clocks-throttle reason bitmask
+	// MemReserved is what the driver and firmware keep for themselves (MiB). It is
+	// not in MemUsed. Nil from a driver that only answers the v1 memory query, whose
+	// MemUsed includes it, and from a probe that predates the field.
+	MemReserved *uint64
+	Temp        *float64
+	Power       *float64 // W
+	PowerCap    *float64 // W
+	ClockSM     *float64 // MHz
+	ClockMem    *float64 // MHz
+	Fan         *float64 // %
+	PcieGen     *int
+	PcieWide    *int
+	Throttle    uint64 // NVML clocks-throttle reason bitmask
 
 	Procs []Proc
 

@@ -413,6 +413,9 @@ func parseGpu(f []string) (wire.Gpu, bool) {
 	g.ClockMem = numPtr(get(11))
 	g.Fan = numPtr(get(12))
 	g.Throttle, _ = strconv.ParseUint(get(14), 10, 64)
+	// Appended after the throttle mask, so a record from an older probe has no
+	// field 15 and reads as "reservation unknown".
+	g.MemReserved = u64Ptr(get(15))
 	return g, true
 }
 

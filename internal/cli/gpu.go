@@ -578,9 +578,11 @@ func observe(cfgPath, hostFilter string, cardsOnly bool, wait time.Duration, sto
 				if g.MemUsed != nil {
 					o.MemUsedMiB = *g.MemUsed
 				}
+				o.MemReservedMiB = g.MemReserved
 				// Attributed memory is what this host's own process list says. The
 				// difference is the card being used by something the host cannot see,
-				// which is the signature of the ledger missing a job.
+				// which is the signature of the ledger missing a job. Used is the
+				// driver's own figure, so the reservation is not part of it.
 				var attributed uint64
 				for _, p := range g.Procs {
 					attributed += p.MemMB

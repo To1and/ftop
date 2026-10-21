@@ -285,16 +285,21 @@ func TestOverdueIsVisible(t *testing.T) {
 	}
 }
 
-// TestAnnotateIgnoresDriverOverhead: an idle card still reports a few hundred MiB with
-// no process behind it (measured: 463 and 526 MiB on two idle 4090s). Flagging that
-// would put a conflict on every idle card in the fleet.
+// TestAnnotateIgnoresDriverOverhead: an idle card can still report memory with no
+// compute process behind it — a desktop's graphics contexts (587 MiB measured on an
+// idle 5090), or the reservation inside a v1-only driver's used figure (458 MiB on a
+// 4090). Flagging that would put a conflict on every such idle card.
 func TestAnnotateIgnoresDriverOverhead(t *testing.T) {
-	views := []CardView{{Card: Card{Host: "h", GPUUUID: "u", MemTotal: 24564}}}
-	Annotate(views, map[string]Observation{
-		"u": {Procs: 0, ProcsKnown: true, MemUsedMiB: 526, MemTotalMiB: 24564, UnattributedMiB: 526},
-	})
-	if views[0].Conflict != "" {
-		t.Errorf("idle card flagged: %q", views[0].Conflict)
+	for _, ob := range []Observation{
+		{MemUsedMiB: 587, MemTotalMiB: 32607, UnattributedMiB: 587},
+		{MemUsedMiB: 458, MemTotalMiB: 24564, UnattributedMiB: 458},
+	} {
+		ob.ProcsKnown = true
+		views := []CardView{{Card: Card{Host: "h", GPUUUID: "u", MemTotal: ob.MemTotalMiB}}}
+		Annotate(views, map[string]Observation{"u": ob})
+		if views[0].Conflict != "" {
+			t.Errorf("idle card with %d MiB flagged: %q", ob.MemUsedMiB, views[0].Conflict)
+		}
 	}
 }
 

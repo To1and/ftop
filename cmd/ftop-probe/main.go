@@ -90,7 +90,7 @@ func main() {
 			// A failed query is not a zero reading. Marking the field absent makes
 			// the reader drop it, so a driver that refused to answer cannot be
 			// rendered as an idle card.
-			util, memUsed, memTotal := "-", "-", "-"
+			util, memUsed, memTotal, memReserved := "-", "-", "-", "-"
 			if r.UtilKnown {
 				util = strconv.FormatInt(int64(r.Util+0.5), 10)
 			}
@@ -98,12 +98,17 @@ func main() {
 				memUsed = strconv.FormatUint(r.MemUsed, 10)
 				memTotal = strconv.FormatUint(r.MemTotal, 10)
 			}
+			if r.ReservedKnown {
+				memReserved = strconv.FormatUint(r.MemReserved, 10)
+			}
 			fmt.Fprintf(out, "%s\t%d\t%s\t%s\t%s\t%s\t%s",
 				wire.KindGpu, d.Index, d.UUID, d.Name, util, memUsed, memTotal)
-			fmt.Fprintf(out, "\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d",
+			// The reservation is appended after the throttle mask: an older reader
+			// stops at the fields it knows and still gets the right used figure.
+			fmt.Fprintf(out, "\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s",
 				fmtField(r.Temp), fmtField(r.Power), fmtField(r.PowerCap),
 				fmtField(r.ClockSM), fmtField(r.ClockMem), fmtField(r.Fan),
-				"", r.Throttle)
+				"", r.Throttle, memReserved)
 			fmt.Fprintln(out)
 
 			if r.ProcsKnown {

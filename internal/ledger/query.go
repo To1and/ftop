@@ -14,13 +14,18 @@ import (
 // held while the card is empty, or a card the ledger calls free while something is
 // running — and the ledger reports the disagreement rather than resolving it.
 type Observation struct {
-	At              time.Time `json:"at"`
-	UtilPct         float64   `json:"util_pct"`
-	MemUsedMiB      uint64    `json:"mem_used_mib,omitempty"`
-	MemTotalMiB     uint64    `json:"mem_total_mib,omitempty"`
-	Procs           int       `json:"procs"`
-	ProcsKnown      bool      `json:"procs_known"`
-	UnattributedMiB int64     `json:"unattributed_mib,omitempty"`
+	At          time.Time `json:"at"`
+	UtilPct     float64   `json:"util_pct"`
+	MemUsedMiB  uint64    `json:"mem_used_mib,omitempty"`
+	MemTotalMiB uint64    `json:"mem_total_mib,omitempty"`
+	// MemReservedMiB is the driver's own reservation, which MemUsedMiB does not
+	// include. Nil when the driver only answers the v1 query: then MemUsedMiB is
+	// total minus free and the reservation is inside it.
+	MemReservedMiB *uint64 `json:"mem_reserved_mib,omitempty"`
+	Procs          int     `json:"procs"`
+	ProcsKnown     bool    `json:"procs_known"`
+	// UnattributedMiB is used memory no process on this host accounts for.
+	UnattributedMiB int64 `json:"unattributed_mib,omitempty"`
 }
 
 // CardView is one card as `ftop gpu list` reports it: what the ledger says, and
@@ -200,12 +205,19 @@ func (s *Store) List(opt ListOptions) ([]CardView, error) {
 // UnattributedThreshold is how much memory with no process behind it counts as
 // evidence that something is running.
 //
-// A card with no processes still reports a few hundred MiB: the driver's own
-// allocation and memory a just-exited process has not returned yet. Measured on this
-// fleet: two idle 4090s reported 463 and 526 MiB with zero processes. Treating that
-// as a job would flag every idle card in the fleet, and a warning that is always on is
-// a warning nobody reads. Five percent plus a floor of 1 GiB clears the noise on every
-// card size here.
+// Used memory no longer includes the driver's reservation: it comes from
+// nvmlDeviceGetMemoryInfo_v2, and an idle headless 4090 now reads 2 MiB where it used
+// to read 458 (457 of them reserved). The threshold stays at five percent with a 1 GiB
+// floor anyway, because two cases still show idle memory with no compute process
+// behind it:
+//
+//   - A workstation's desktop. Graphics contexts are not in NVML's compute-process
+//     list, and an idle 5090 driving a display was measured at 587 MiB.
+//   - A driver without the v2 query, which still reports total minus free — the
+//     reservation (about 0.5 GiB on these cards) plus the rest.
+//
+// Lowering it would mark those idle cards unclaimed and take them out of every
+// automatic placement; a warning that is always on is a warning nobody reads.
 func UnattributedThreshold(memTotalMiB uint64) int64 {
 	const floorMiB = 1024
 	if memTotalMiB == 0 {

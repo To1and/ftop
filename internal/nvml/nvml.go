@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"unsafe"
 
 	"github.com/ebitengine/purego"
 )
@@ -71,6 +72,7 @@ type Client struct {
 	getName       func(uintptr, *byte, uint32) int32
 	getUtil       func(uintptr, *[2]uint32) int32
 	getMem        func(uintptr, *memInfo) int32
+	getMemV2      func(uintptr, *memInfoV2) int32 // nil when the driver lacks the symbol
 	getTemp       func(uintptr, uint32, *uint32) int32
 	getPower      func(uintptr, *uint32) int32
 	getPowerLimit func(uintptr, *uint32) int32
@@ -89,11 +91,34 @@ type Client struct {
 const procBufCap = 512
 
 // memInfo mirrors nvmlMemory_t.
+//
+// Its Used is Total minus Free, which counts the memory the driver and firmware
+// reserve for themselves. On a 4090 under driver 565 that is 457 MiB, so every idle
+// card read 458 MiB used and every card in the fleet read the same. It is only the
+// fallback for a driver without memInfoV2.
 type memInfo struct {
 	Total uint64
 	Free  uint64
 	Used  uint64
 }
+
+// memInfoV2 mirrors nvmlMemory_v2_t: the v1 fields with the reservation split out,
+// so Used is what processes and the driver actually allocated — the number
+// nvidia-smi shows as memory.used.
+//
+// Go aligns Total to 8 exactly as C does, leaving the same 4 bytes of padding after
+// Version; TestMemInfoV2Layout pins it.
+type memInfoV2 struct {
+	Version  uint32
+	Total    uint64
+	Reserved uint64
+	Free     uint64
+	Used     uint64
+}
+
+// memInfoV2Version is NVML_STRUCT_VERSION(Memory, 2): the struct's size with the
+// version number in the top byte. The driver checks it before writing anything.
+const memInfoV2Version = uint32(unsafe.Sizeof(memInfoV2{})) | 2<<24
 
 // procInfo mirrors nvmlProcessInfo_t.
 type procInfo struct {
@@ -128,6 +153,11 @@ func (c *Client) Open() error {
 		purego.RegisterLibFunc(&c.getName, lib, "nvmlDeviceGetName")
 		purego.RegisterLibFunc(&c.getUtil, lib, "nvmlDeviceGetUtilizationRates")
 		purego.RegisterLibFunc(&c.getMem, lib, "nvmlDeviceGetMemoryInfo")
+		// _v2 arrived with driver 510. RegisterLibFunc panics on a missing symbol, so
+		// it is looked up first; an older driver keeps the v1 reading.
+		if sym, err := purego.Dlsym(lib, "nvmlDeviceGetMemoryInfo_v2"); err == nil {
+			purego.RegisterFunc(&c.getMemV2, sym)
+		}
 		purego.RegisterLibFunc(&c.getTemp, lib, "nvmlDeviceGetTemperature")
 		purego.RegisterLibFunc(&c.getPower, lib, "nvmlDeviceGetPowerUsage")
 		purego.RegisterLibFunc(&c.getPowerLimit, lib, "nvmlDeviceGetEnforcedPowerLimit")
@@ -218,12 +248,7 @@ func (c *Client) Read(d Device, includeProcs bool) Reading {
 		r.Util = float64(util[0])
 		r.UtilKnown = true
 	}
-	var mi memInfo
-	if c.getMem(d.handle, &mi) == 0 {
-		r.MemUsed = mi.Used / (1 << 20)
-		r.MemTotal = mi.Total / (1 << 20)
-		r.MemKnown = true
-	}
+	r.readMem(c.getMemV2, c.getMem, d.handle)
 	// nvmlDeviceGetTemperature writes an unsigned int; the error code, not a -1
 	// sentinel, is what reports "unknown".
 	if p := c.u32Ptr(func(v *uint32) int32 { return c.getTemp(d.handle, tempGpu, v) }); p != nil {
@@ -281,10 +306,14 @@ type Reading struct {
 	// did not answer". The plain values cannot: an unsupported or failing query
 	// leaves 0, and 0 renders as an idle card. A GPU the monitor cannot read must
 	// look unreadable, not idle.
-	Util                  float64
-	UtilKnown             bool
-	MemUsed, MemTotal     uint64
-	MemKnown              bool
+	Util              float64
+	UtilKnown         bool
+	MemUsed, MemTotal uint64
+	MemKnown          bool
+	// MemReserved is what the driver and firmware keep for themselves, not counted
+	// in MemUsed. ReservedKnown is false on the v1 fallback, whose MemUsed includes it.
+	MemReserved           uint64
+	ReservedKnown         bool
 	Temp, Power, PowerCap *float64
 	ClockSM, ClockMem     *float64
 	Fan                   *float64
@@ -295,6 +324,34 @@ type Reading struct {
 	Procs      []procInfo
 	ProcsKnown bool
 }
+
+// readMem fills the memory fields, from v2 when the driver answers it and from v1
+// otherwise.
+//
+// Any v2 failure falls back rather than leaving the card unread: NOT_SUPPORTED, a
+// version mismatch or a missing symbol says nothing about the memory, and v1 still
+// knows it. Only both failing makes the reading unknown — never zero.
+func (r *Reading) readMem(v2 func(uintptr, *memInfoV2) int32, v1 func(uintptr, *memInfo) int32, h uintptr) {
+	if v2 != nil {
+		mi := memInfoV2{Version: memInfoV2Version}
+		if v2(h, &mi) == 0 {
+			r.MemUsed, r.MemTotal = toMiB(mi.Used), toMiB(mi.Total)
+			r.MemReserved, r.ReservedKnown = toMiB(mi.Reserved), true
+			r.MemKnown = true
+			return
+		}
+	}
+	var mi memInfo
+	if v1(h, &mi) == 0 {
+		r.MemUsed, r.MemTotal = toMiB(mi.Used), toMiB(mi.Total)
+		r.MemKnown = true
+	}
+}
+
+// toMiB rounds up to a whole MiB, as nvidia-smi does. Truncating read an idle 4090's
+// 1.06 MiB as 1 and its 456.94 MiB reservation as 456, one off from the number a
+// reader checks it against; rounding up also never shows an allocation as nothing.
+func toMiB(b uint64) uint64 { return (b + 1<<20 - 1) >> 20 }
 
 // u32Ptr calls a uint-returning getter and converts to a float pointer.
 func (c *Client) u32Ptr(fn func(*uint32) int32) *float64 {

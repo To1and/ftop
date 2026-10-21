@@ -258,7 +258,10 @@ counts every card whose process list was not read, including all of them under
 
 ## What the numbers mean
 
-- **VRAM**: `memory.used` as NVML reports it, the same number `nvidia-smi` shows.
+- **VRAM**: `used` from `nvmlDeviceGetMemoryInfo_v2`, the same number `nvidia-smi`
+  shows as `memory.used`. The driver's own reservation (457 MiB on a 4090) is not
+  in it; the v1 query counted it as used, so every idle card read 458 MiB. A driver
+  without v2 falls back to v1, total minus free.
 - **Power**: NVML returns **milliwatts**, divided by 1000. It once was not, and
   an idle 27 W card read 27791 W.
 - **Host memory**: cgroup usage **minus reclaimable page cache**
