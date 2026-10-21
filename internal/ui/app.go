@@ -194,8 +194,10 @@ type App struct {
 	tickGen   int
 	chainRate tickRate
 	// spinStep is the interval at which some lamp on the board next changes
-	// frame (nanoseconds; 0 when none is turning), kept by refreshSpin.
-	spinStep atomic.Int64
+	// frame (nanoseconds; 0 when none is turning), kept by refreshSpin. hostSpin
+	// is the same for the lamps of the host under the cursor, which are the only
+	// ones a host view draws.
+	spinStep, hostSpin atomic.Int64
 	// hold says this message's frame waits for the next tick, and held is the
 	// frame shown meanwhile (see Update).
 	hold bool
@@ -315,24 +317,35 @@ const (
 )
 
 // tickRate is the frame rate while the board is on screen and a bar on it is
-// moving, a lamp's step while one is turning, at rest otherwise. A host view has
-// neither lamps nor gliding bars, so it never needs either.
+// moving, a lamp's step while a lamp on screen is turning, at rest otherwise. A
+// host view has no gliding bars, and its lamps are its own host's: one turning on
+// another machine does not keep it fast.
 //
-// The answer comes from an atomic flag set where the holders are, not from taking
+// The answer comes from atomic flags set where the holders are, not from taking
 // a.mu. This runs on the Bubble Tea goroutine between frames, and the one thing it
 // must never do is block on the render lock: a lock-free read here means the frame
 // rate cannot deadlock against a draw, and the cost of being at most one message
 // stale is a single repaint at the old period.
 func (a *App) tickRate() tickRate {
 	switch {
-	case !a.boardShown():
-		return rateRest
-	case a.moving():
+	case a.boardShown() && a.moving():
 		return rateFrame
-	case a.spinStep.Load() > 0:
+	case a.spinNow() > 0:
 		return rateSpin
 	}
 	return rateRest
+}
+
+// spinNow is the step of the lamps on screen: the board's, or those of the host a
+// host view shows. The full process table draws none.
+func (a *App) spinNow() time.Duration {
+	switch {
+	case a.boardShown():
+		return time.Duration(a.spinStep.Load())
+	case a.procView:
+		return 0
+	}
+	return time.Duration(a.hostSpin.Load())
 }
 
 // tickPeriod is how long until the next repaint at the rate the board needs.
@@ -345,7 +358,11 @@ func (a *App) tickPeriod() time.Duration {
 		// not in between, where every frame would be the one before. A spinner
 		// whose frames land on the frame rate's grid instead of its own would
 		// also step unevenly, a frame early here and late there.
-		step := time.Duration(a.spinStep.Load())
+		step := a.spinNow()
+		if step <= 0 {
+			// The lamps stopped between the rate and this read.
+			return time.Second
+		}
 		d := step - time.Duration(time.Now().UnixNano()%int64(step))
 		if d < step/4 {
 			d += step
@@ -404,13 +421,15 @@ func (a *App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, nil
 
 	case tea.KeyPressMsg:
-		// A key can bring the board back on screen, so it may need the clock
-		// brought up to the frame rate with it.
+		// A key can bring the board back on screen, or open a host whose lamps are
+		// turning, so it may need the clock brought up with it.
 		m2, cmd := a.press(m.String())
+		a.refreshSpinLocked()
 		return m2, tea.Batch(cmd, a.hurry())
 
 	case tea.MouseClickMsg:
 		m2, cmd := a.click(m.Mouse())
+		a.refreshSpinLocked()
 		return m2, tea.Batch(cmd, a.hurry())
 
 	case tea.MouseWheelMsg:

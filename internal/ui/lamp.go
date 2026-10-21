@@ -190,21 +190,38 @@ func lampStep(st lampState) time.Duration {
 	return sty.step
 }
 
-// refreshSpin records how often the board's turning lamps change frame: the
-// greatest step that lands on every one of their frames, so lamps of different
-// steps on one board are all drawn on time.
-// Called with a.mu held, wherever the holders or the readings change.
+// refreshSpin records how often the turning lamps change frame: the greatest step
+// that lands on every one of their frames, so lamps of different steps on one
+// screen are all drawn on time. It keeps two answers, the whole board's and the
+// host under the cursor's, because a host view draws only that host's lamps.
+// Called with a.mu held, wherever the holders, the readings or the cursor change.
 func (a *App) refreshSpin() {
-	var step time.Duration
+	shown := ""
+	if len(a.order) > 0 {
+		shown = a.order[min(max(a.cursor, 0), len(a.order)-1)]
+	}
+	var step, here time.Duration
 	for _, st := range a.states {
 		for _, g := range st.sample.Gpus {
 			h, ok := a.holders[ledgerKey(st.name, g)]
 			if s := lampStep(lampFor(h, ok, wireGPU{util: g.UtilPct()})); s > 0 {
 				step = gcdDuration(step, s)
+				if st.name == shown {
+					here = gcdDuration(here, s)
+				}
 			}
 		}
 	}
 	a.spinStep.Store(int64(step))
+	a.hostSpin.Store(int64(here))
+}
+
+// refreshSpinLocked is refreshSpin for a caller that does not hold a.mu: a key or
+// a click that moved the cursor to another host.
+func (a *App) refreshSpinLocked() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.refreshSpin()
 }
 
 func gcdDuration(a, b time.Duration) time.Duration {

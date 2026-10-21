@@ -385,7 +385,11 @@ make vet
   colour, the rest of the message dimmer after it.
 - **A host's view lists each card's top three processes** by memory and counts
   the rest on the box's border: a card shared by sixteen workers no longer
-  takes half the screen.
+  takes half the screen. Every box keeps three process rows, so boxes side by
+  side line up and a job starting moves nothing.
+- **A held card names its thread, not its runtime.** The box's first line is the
+  holding conversation's id in its runtime's colour, why, and since when; a card
+  nobody holds says `free`, or `unclaimed` when something runs on it anyway.
 - **A GPU takes two lines on a narrow lane.** Under 70 columns of card content
   (three lanes on a 200-column terminal) one line left short bars, two-cell
   gaps and an eight-cell graph; two lines stack the VRAM bar under the

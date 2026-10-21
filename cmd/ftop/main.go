@@ -167,6 +167,9 @@ func main() {
 		// through the queue.
 		src := demo.New()
 		src.Warm(90, func(m sshx.SampleMsg) { app.Deliver(m) }, func(m sshx.ErrMsg) { app.Deliver(m) })
+		// The ledger reader below is skipped in demo mode, so the demo's claims are
+		// delivered here, once: they change only when an agent claims or releases.
+		app.Deliver(ui.DemoLedger(time.Now()))
 		readers.Add(1)
 		go func() {
 			defer readers.Done()

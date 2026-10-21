@@ -123,15 +123,30 @@ The layout was chosen in review rounds with the HTML/xterm.js renders that
 
 ## Host view
 
-Each device box has its gauges and the process table on the left and the
-device's history on the right, running from the box's first row to its last,
-so the graph's floor is the box's bottom. The reading columns are as wide as
-the widest value of each field the host's devices report, and a field none of
-them reports takes no column at all (no `— MEM` in every box), so the graph
-starts a gap after the last reading and does not move with the load; the
-command column stops a gap short of the graph. Each box lists its device's top
-three processes by memory and counts the rest (`+5 more`), so one busy card
-cannot take half the screen.
+Each device box opens with its claim line: the card's lamp, then the holding
+thread's id (the first eight characters of the conversation, in its runtime's
+brand colour), why it was claimed, and `since 14:02` at the right end, with
+`overdue` before it once the claim's time has run out. A card nobody holds says
+`free` when nothing runs on it and `unclaimed`, in the warning colour, when
+something does. The runtime's name is not on the line: the id is what a reader
+looks up, and on a fleet run by one kind of agent the name said the same thing
+on every card.
+
+Under it are the three gauges, each with the readings about the same thing:
+the compute clock and the link beside utilisation, used of total and the memory
+clock beside VRAM, the watts and the heat they make (`41°C fan 41%`) beside
+power. Then three process rows, always three, so every box is the same height
+and an idle card lines up with a busy one beside it; the top three by memory are
+listed and the rest counted (`+5 more`). The process columns are named in the
+bottom border (`pid ─ user ─ vram ─ command`), the way the board names its own,
+rather than in a header row.
+
+The device's history runs down the right side from the gauges to the box's
+bottom, so the graph's floor is the box's floor. The reading columns are as wide
+as the widest value of each field the host's devices report, and a field none of
+them reports takes no column at all (no `— MEM` in every box); the graph starts a
+gap after the last reading, but never before a command has 28 cells to be read
+in, and the command column stops a gap short of it.
 
 Graphs colour by height: each cell takes the ramp's colour for how many dot rows
 it reaches above the graph's floor, so a tall spike walks the ramp to its bright

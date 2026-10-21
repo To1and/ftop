@@ -39,6 +39,7 @@ func main() {
 		app := ui.New(ui.Options{Hosts: demo.Hosts(), GraphRows: 1, Interval: time.Second})
 		src := demo.New()
 		src.Warm(*warm, func(m sshx.SampleMsg) { app.Deliver(m) }, func(m sshx.ErrMsg) { app.Deliver(m) })
+		app.Deliver(ui.DemoLedger(time.Now()))
 		return app
 	}
 	app := newApp()

@@ -502,7 +502,8 @@ func TestBarsSitAgainstTheirPercentages(t *testing.T) {
 }
 
 // TestHostReadingsKeepTheirColumns: a reading too wide for its column is cut
-// rather than run into the next one.
+// rather than run into the next one, and each gauge carries its own readings —
+// the link beside utilisation, the heat beside power.
 func TestHostReadingsKeepTheirColumns(t *testing.T) {
 	for _, w := range []int{76, 100, 160} {
 		a := fixture(w, 40, []int{1})
@@ -512,16 +513,25 @@ func TestHostReadingsKeepTheirColumns(t *testing.T) {
 		g.Power, g.PowerCap, g.PcieGen, g.PcieWide = &p, &c, &gen, &lanes
 		a.mu.Unlock()
 		a.open("hosta")
+		var util, power string
 		for _, line := range strings.Split(a.detailCanvas().Plain(), "\n") {
-			if !strings.Contains(line, "power") {
-				continue
+			switch {
+			case strings.HasPrefix(line, "│ util "):
+				util = line
+			case strings.HasPrefix(line, "│ power "):
+				power = line
 			}
-			i := strings.Index(line, "PCIe")
-			if i < 0 {
-				t.Errorf("width %d: the PCIe reading is gone: %q", w, line)
-			} else if !strings.HasSuffix(line[:i], strings.Repeat(" ", detailGap)) {
-				t.Errorf("width %d: the power reading runs into the PCIe column: %q", w, line)
-			}
+		}
+		if !strings.Contains(util, "PCIe") {
+			t.Errorf("width %d: the PCIe reading is not beside utilisation: %q", w, util)
+		}
+		i := strings.Index(power, "°C")
+		if i < 0 {
+			t.Fatalf("width %d: the temperature is not beside power: %q", w, power)
+		}
+		before := strings.TrimRight(power[:i], "0123456789")
+		if !strings.HasSuffix(before, "…"+strings.Repeat(" ", detailGap)) {
+			t.Errorf("width %d: the power reading is not cut a gap short of the temperature: %q", w, power)
 		}
 	}
 }
@@ -650,7 +660,10 @@ func TestHostGraphReachesTheBoxBottom(t *testing.T) {
 	a := fixture(160, 40, []int{1})
 	a.mu.Lock()
 	st := a.states["hosta"]
-	st.sample.Gpus[0].Procs = []wire.Proc{{PID: 7, User: "z", Name: strings.Repeat("a-very-long-command-line ", 8)}}
+	// The box keeps three process rows whatever is on the card; three processes
+	// fill them, so the last row has a command to collide with the graph.
+	long := strings.Repeat("a-very-long-command-line ", 8)
+	st.sample.Gpus[0].Procs = []wire.Proc{{PID: 7, User: "z", Name: long, MemMB: 300}, {PID: 8, User: "z", Name: long, MemMB: 200}, {PID: 9, User: "z", Name: long, MemMB: 100}}
 	for i := 0; i < 200; i++ {
 		st.gpuHist[gpuKey(st.sample.Gpus[0])] = appendCapped(st.gpuHist[gpuKey(st.sample.Gpus[0])], 60)
 	}
@@ -819,7 +832,8 @@ func TestNarrowLanesStackAGPU(t *testing.T) {
 // TestHostGraphFollowsTheReadings: a host's reading columns are as wide as the
 // readings its devices report, and a field no device reports takes no column at
 // all, so the graph starts a gap after the last column rather than past cells
-// reserved for a measurement this host never gives.
+// reserved for a measurement this host never gives — or, when the readings are
+// narrow, a gap after the room a process's command needs.
 func TestHostGraphFollowsTheReadings(t *testing.T) {
 	a := fixture(200, 40, []int{1})
 	a.mu.Lock()
@@ -840,6 +854,7 @@ func TestHostGraphFollowsTheReadings(t *testing.T) {
 	for _, c := range cols {
 		gx += c + detailGap
 	}
+	gx = max(gx, 2+procCmdDX+minCmdW+detailGap)
 	a.open("hosta")
 	for _, line := range strings.Split(a.detailCanvas().Plain(), "\n") {
 		if !strings.Contains(line, "│ vram ") {

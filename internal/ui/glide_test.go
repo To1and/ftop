@@ -130,19 +130,28 @@ func TestASampleHurriesTheClock(t *testing.T) {
 	}
 }
 
-// TestHostViewStaysSlow: a host view has no lamps and no gliding bars, so a lamp
-// turning on the board behind it does not keep it fast.
-func TestHostViewStaysSlow(t *testing.T) {
-	a := fixture(200, 40, []int{2})
+// TestHostViewTurnsOnlyForItsOwnLamps: a host view draws its own host's lamps, on
+// each card's claim line, so it repaints on their step while one of them turns;
+// a lamp turning on another machine does not keep it fast.
+func TestHostViewTurnsOnlyForItsOwnLamps(t *testing.T) {
+	a := fixture(200, 40, []int{2, 1})
 	a.changed.Store(0)
 	st := a.states["hosta"]
 	a.Update(LedgerMsg{At: time.Now(), Holders: map[string]Holder{ledgerKey("hosta", st.sample.Gpus[1]): {Owner: "codex/x"}}})
 	if got := a.tickPeriod(); got >= time.Second {
 		t.Fatalf("the board with a turning lamp repaints every %v", got)
 	}
-	a.detail = true
+	a.open("hosta")
+	a.refreshSpinLocked()
+	if got := a.tickPeriod(); got >= time.Second {
+		t.Errorf("the host view of the turning lamp repaints every %v", got)
+	}
+	a.Update(keyMsg("right"))
+	if got := a.order[a.cursor]; got != "hostb" {
+		t.Fatalf("→ moved the host view to %q, want hostb", got)
+	}
 	if got := a.tickPeriod(); got != time.Second {
-		t.Errorf("a host view repaints every %v, want one second", got)
+		t.Errorf("a host view with no turning lamp repaints every %v, want one second", got)
 	}
 	a.help = true
 	if got := a.tickPeriod(); got >= time.Second {

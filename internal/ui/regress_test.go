@@ -24,9 +24,10 @@ func TestTinyTerminalDoesNotPanic(t *testing.T) {
 	}
 }
 
-// TestDetailProcessRowsDoNotOverwriteVRAMBar checks the actual rows: the gauge
-// block owns the three rows under the box's top border, the process table starts
-// below it, and nothing from the table may land on a gauge row.
+// TestDetailProcessRowsDoNotOverwriteVRAMBar checks the actual rows: the claim
+// line is first, the gauge block owns the three rows under it, the process table
+// starts below them with its column names in the bottom border, and nothing from
+// the table may land on a gauge row.
 func TestDetailProcessRowsDoNotOverwriteVRAMBar(t *testing.T) {
 	a := fixture(160, 40, []int{1})
 	a.mu.Lock()
@@ -46,7 +47,7 @@ func TestDetailProcessRowsDoNotOverwriteVRAMBar(t *testing.T) {
 	if boxTop < 0 {
 		t.Fatal("could not locate the GPU box")
 	}
-	vramRow := rowText(c, boxTop+2)
+	vramRow := rowText(c, boxTop+3)
 	if !strings.HasPrefix(vramRow, "│ vram") {
 		t.Fatalf("second gauge row is not VRAM: %q", vramRow)
 	}
@@ -56,11 +57,11 @@ func TestDetailProcessRowsDoNotOverwriteVRAMBar(t *testing.T) {
 	if !strings.Contains(vramRow, "G/") && !strings.Contains(vramRow, "M/") {
 		t.Errorf("VRAM row lost its memory reading: %q", vramRow)
 	}
-	if hdr := rowText(c, boxTop+1+detailGraphH); !strings.Contains(hdr, "Pid") {
-		t.Errorf("process header is not directly below the gauges: %q", hdr)
+	if procRow := rowText(c, boxTop+2+detailGauges); !strings.Contains(procRow, "4242") {
+		t.Errorf("first process line is not directly below the gauges: %q", procRow)
 	}
-	if procRow := rowText(c, boxTop+2+detailGraphH); !strings.Contains(procRow, "4242") {
-		t.Errorf("first process line is not directly below the header: %q", procRow)
+	if foot := rowText(c, boxTop+detailBoxHeight-1); !strings.Contains(foot, " pid ") || !strings.Contains(foot, " command ") {
+		t.Errorf("the process columns are not named in the bottom border: %q", foot)
 	}
 }
 

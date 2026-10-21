@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"strings"
 	"time"
 
 	"ftop/internal/sshx"
@@ -61,6 +62,47 @@ var fleet = []spec{
 	{name: "box-06", err: "connection timed out: ssh: connect to host 192.0.2.21 port 22"},
 	{name: "box-07", err: "authentication failed: Permission denied (publickey)"},
 }
+
+// Claim is one synthetic ledger entry: a card of the demo fleet held by a thread.
+//
+// The ledger is a record, not a measurement, so the demo states it the way the
+// ledger does — which thread, why, since when — and the board draws it the way it
+// draws a real one. Every state a card can be in appears somewhere: held and busy,
+// held and idle, overdue, and (on the cards no claim names) unclaimed and free.
+type Claim struct {
+	Host    string
+	GPU     int
+	Owner   string // "kind/thread", as the ledger records it
+	Why     string
+	Age     time.Duration
+	Overdue bool
+}
+
+// Claims is the demo fleet's ledger. The thread ids are made up: no id from a
+// real conversation belongs in a binary that ships.
+func Claims() []Claim {
+	var out []Claim
+	add := func(host string, gpus []int, owner, why string, age time.Duration, overdue bool) {
+		for _, k := range gpus {
+			out = append(out, Claim{host, k, owner, why, age, overdue})
+		}
+	}
+	add("dc-a", []int{0, 1, 2, 3, 4, 5}, "claude-code/3f9a1c2e",
+		"pretrain run 14: 8B, seq 8192, resumed from step 41000", 5*time.Hour, false)
+	add("dc-a", []int{6, 7}, "codex/7b2d40e1",
+		"eval harness: nightly regression on pick_place", 40*time.Minute, false)
+	add("node-a", []int{0, 1, 2, 3}, "claude-code/c41e9d07",
+		"lr sweep 3e-4..1e-3, four seeds, one per card", 2*time.Hour, false)
+	add("node-a", []int{4}, "codex/e2a05f6b",
+		"ablation: no-augmentation baseline", 26*time.Hour, true)
+	add("box-01", []int{0, 1}, "codex/7b2d40e1",
+		"eval harness: nightly regression on pick_place", 40*time.Minute, false)
+	return out
+}
+
+// UUID is the identity the demo fleet gives card k of host: the key a claim is
+// stored under.
+func UUID(host string, k int) string { return fmt.Sprintf("GPU-demo-%s-%d", host, k) }
 
 // Hosts lists the synthetic fleet's names.
 func Hosts() []string {
@@ -187,9 +229,20 @@ func (s spec) at(i, n int, rng *rand.Rand) wire.Sample {
 		capw := s.cap
 
 		g := wire.Gpu{
-			Index: k, Name: s.model, UUID: fmt.Sprintf("GPU-demo-%s-%d", s.name, k),
+			Index: k, Name: s.model, UUID: UUID(s.name, k),
 			Util: &u, MemUsed: &used, MemTotal: &total,
 			Temp: &temp, Power: &pw, PowerCap: &capw, ClockSM: &clk,
+		}
+		if strings.Contains(s.model, "GeForce") {
+			// Consumer cards have a fan and report their memory clock, which drops
+			// to its idle step when nothing runs; the data-centre cards here report
+			// neither, so the fleet has both shapes of reading column.
+			fan := math.Round(30 + u*0.45)
+			mclk := 405.0
+			if u > 5 {
+				mclk = 10501
+			}
+			g.Fan, g.ClockMem = &fan, &mclk
 		}
 		if u > 40 {
 			g.Procs = []wire.Proc{{PID: 40000 + i*100 + k, Name: "train.py", User: "demo", MemMB: used * 9 / 10}}

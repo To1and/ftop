@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"ftop/internal/theme"
@@ -14,14 +15,31 @@ import (
 // with their absolute values, the device's own history at full height, and every
 // process with its owner. It is the only place processes appear.
 
-// Detail geometry. The gauges are capped for the same reason as on the board: a
-// bar past ~20 cells adds no precision, and the width is worth more as history.
+// Detail geometry. The gauges are as short as the board's: a bar past ~14 cells
+// adds no precision, and the width is worth more as history.
+//
+// A device box is the same height whatever is on the card: its border, the claim
+// line, three gauges and three process rows. A box that grew with its process list
+// moved every box below it when a job started, and two boxes side by side stopped
+// lining up.
 const (
 	detailLabelW = 6  // "power "
-	detailBarW   = 20 // gauge length
-	detailGraphH = 3  // gauge rows; the history beside them runs to the box's bottom
+	detailBarW   = 14 // gauge length
+	detailGauges = 3  // util, vram, power
 	minDetailCol = 90 // narrowest a device box may be in a two-column layout
 	detailGap    = 3  // between elements, as on the board
+	// minCmdW is the narrowest a process's command may be before the history
+	// gives way: "python3 -u eval_harness.py" whole.
+	minCmdW = 28
+)
+
+// The process table's columns, from the box's inner edge: the pid and the VRAM
+// right-aligned, the user, and the command after them, which takes the rest.
+const (
+	procPidW  = 7
+	procUserW = 10
+	procMemW  = 7
+	procCmdDX = procPidW + detailGap + procUserW + detailGap + procMemW + detailGap
 )
 
 // detailCols are the widths of the reading columns beside the gauges, so the
@@ -42,7 +60,7 @@ func detailCols(gpus []wire.Gpu) []int {
 		}
 		return w
 	}
-	cols := []int{0, 0, 0}
+	cols := []int{0, 0}
 	for _, g := range gpus {
 		mem := 1 // "—"
 		switch {
@@ -62,11 +80,17 @@ func detailCols(gpus []wire.Gpu) []int {
 		if g.PcieGen != nil && g.PcieWide != nil {
 			pcie = 12 // "PCIe 5.0 ×16"
 		}
+		// The temperature and the fan are one reading, the heat and what is done
+		// about it: "105°C fan 100%". As two columns the fan sat a whole memory
+		// clock's width away from the temperature it answers.
+		heat := known(g.Temp, 5, 0)
+		if g.Fan != nil {
+			heat = max(heat, 1) + 1 + 8 // "— fan 100%" when only the fan reports
+		}
 		// A field the card never reports takes no column: "—" in every box is a
 		// measurement this host has none of, and its cells are the graph's.
-		cols[0] = max(cols[0], known(g.ClockSM, 10, 0), mem, pwr)                   // "9.99GHz SM"
-		cols[1] = max(cols[1], known(g.Temp, 5, 0), known(g.ClockMem, 12, 0), pcie) // "105°C", "10.50GHz MEM"
-		cols[2] = max(cols[2], known(g.Fan, 8, 0))                                  // "fan 100%"
+		cols[0] = max(cols[0], known(g.ClockSM, 10, 0), mem, pwr)    // "9.99GHz SM"
+		cols[1] = max(cols[1], heat, known(g.ClockMem, 12, 0), pcie) // "10.50GHz MEM"
 	}
 	for len(cols) > 0 && cols[len(cols)-1] == 0 {
 		cols = cols[:len(cols)-1]
@@ -74,17 +98,16 @@ func detailCols(gpus []wire.Gpu) []int {
 	return cols
 }
 
-// maxProcs is how many of a device's processes a box lists. A card belongs to a
-// device, not to a job, so the list is what is ON it: the top three by memory,
-// the rest counted rather than listed. A list that grew with the job turned one
-// box into half the screen and squeezed every other card off it.
+// maxProcs is how many of a device's processes a box lists, and how many rows it
+// keeps for them. A card belongs to a device, not to a job, so the list is what is
+// ON it: the top three by memory, the rest counted rather than listed. A list that
+// grew with the job turned one box into half the screen and squeezed every other
+// card off it.
 const maxProcs = 3
 
-// detailBoxHeight is a device box's height: border, three gauge rows, the process
-// header, and at least one process line (or the reason there are none).
-func detailBoxHeight(procs int) int {
-	return 2 + detailGraphH + 1 + max(1, min(procs, maxProcs))
-}
+// detailBoxHeight is a device box's height: border, the claim line, the gauges and
+// the process rows.
+const detailBoxHeight = 2 + 1 + detailGauges + maxProcs
 
 // detailCanvas draws one host's devices.
 //
@@ -123,7 +146,7 @@ func (a *App) detailCanvas() *Canvas {
 	heights := make([]int, len(gpus))
 	for i, g := range gpus {
 		procs[i] = dedupeProcs(g.Procs)
-		heights[i] = detailBoxHeight(len(procs[i]))
+		heights[i] = detailBoxHeight
 	}
 	cols := 1
 	if a.width >= 2*minDetailCol+1 && len(gpus) > 1 {
@@ -137,12 +160,11 @@ func (a *App) detailCanvas() *Canvas {
 	body := a.bodyCanvas(a.width, max(total, 1), s.Bg)
 	buf := make([]theme.Cell, 0, detailBarW+1)
 	readCols := detailCols(gpus)
+	now := a.clock()
 	for i, g := range gpus {
-		var hp *Holder
-		if hv, ok := a.holders[ledgerKey(h.name, g)]; ok {
-			hp = &hv
-		}
-		detailBox(body, xs[lane[i]], ys[i], ws[lane[i]], heights[i], g, h.gpuHist[gpuKey(g)], procs[i], h.missing[gpuKey(g)], readCols, s, buf, hp)
+		hv, held := a.holders[ledgerKey(h.name, g)]
+		cl := claim{h: hv, held: held, lamp: lampFor(hv, held, wireGPU{util: g.UtilPct()}), now: now, read: a.ledgerAt}
+		detailBox(body, xs[lane[i]], ys[i], ws[lane[i]], heights[i], g, h.gpuHist[gpuKey(g)], procs[i], h.missing[gpuKey(g)], readCols, s, buf, cl)
 	}
 
 	top += stackGap
@@ -436,53 +458,137 @@ func topByRSS(ps []wire.HostProc, n int) []wire.HostProc {
 	return out
 }
 
-// detailBox draws one device: three gauges with absolute values on the left, the
-// device's history graph beside them, the process table below.
-func detailBox(c *Canvas, x, y, w, h int, g wire.Gpu, hist []float64, procs []wire.Proc, missing bool, cols []int, s *theme.Skin, buf []theme.Cell, holder *Holder) {
+// claim is what the ledger says about one card, ready to draw: the holder if
+// there is one, the card's lamp at the frame's moment, and when the ledger was
+// read, which is the "today" a claim's time is told against. The frame's own
+// clock is a fixed moment in a snapshot, and would date every claim as long ago.
+type claim struct {
+	h    Holder
+	held bool
+	lamp lampState
+	now  time.Time
+	read time.Time
+}
+
+// threadIDW is how much of a thread's id the claim line prints: the first eight
+// characters, which is how both runtimes' own lists abbreviate a conversation.
+const threadIDW = 8
+
+// threadID is the conversation part of a claim's "kind/thread" owner, cut to
+// threadIDW cells without an ellipsis — a prefix of an id, the way a short commit
+// hash is. An owner with no thread (an agent whose runtime names none) is shown
+// as recorded.
+func threadID(owner string) string {
+	id := owner
+	if i := strings.IndexByte(owner, '/'); i >= 0 && i+1 < len(owner) {
+		id = owner[i+1:]
+	}
+	var b strings.Builder
+	used := 0
+	theme.EachGlyph(id, func(g theme.Glyph) bool {
+		if used+g.W > threadIDW {
+			return false
+		}
+		b.WriteString(g.Text)
+		used += g.W
+		return true
+	})
+	return b.String()
+}
+
+// sinceText is when a claim was taken, as a reader's clock shows it: "14:02" the
+// same day, "Oct 19" before. A duration ("2h") read as a countdown as often as an
+// age; a time of day cannot be misread.
+func sinceText(since, now time.Time) string {
+	since, now = since.Local(), now.Local()
+	y1, m1, d1 := since.Date()
+	y2, m2, d2 := now.Date()
+	if y1 == y2 && m1 == m2 && d1 == d2 {
+		return since.Format("15:04")
+	}
+	return since.Format("Jan 2")
+}
+
+// claimLine is a device box's first line: who holds the card, as the ledger
+// records it, or that nobody does.
+//
+// A held card shows its lamp, the holding thread's id in its runtime's brand
+// colour, why it was claimed, and since when. The id is what a reader takes to
+// their agent's list to find the conversation; the runtime's name the line used
+// to show ("held · claude-code") only said which kind of agent to look among, and
+// on a fleet run by one kind it said the same thing on every card.
+//
+// A card nobody holds says which of two things that is: "free" when nothing runs
+// on it, "unclaimed" when something does — a job the ledger knows nothing about,
+// which is the warning the next agent needs before it takes the card.
+func claimLine(c *Canvas, x, y, w int, cl claim, running bool, t *theme.Theme) {
+	glyph, fg := lampCell(cl.lamp, cl.now)
+	c.Put(x, y, glyph, fg)
+	tx, end := x+2, x+w
+	if !cl.held {
+		if running {
+			c.Text(tx, y, "unclaimed", t.C("warn"))
+		} else {
+			c.Text(tx, y, "free", t.C("graph_text"))
+		}
+		return
+	}
+	// The time takes the line's right end, so the reasons of a column of boxes
+	// start and stop in the same places. An overdue claim says so before it: the
+	// lamp has already turned to the warning colour, and the word says why.
+	var right []seg
+	if !cl.h.Since.IsZero() {
+		right = []seg{{"since " + sinceText(cl.h.Since, cl.read), t.C("graph_text"), false}}
+	}
+	if cl.h.Overdue {
+		if len(right) > 0 {
+			right = append([]seg{{" · ", t.C("graph_text"), false}}, right...)
+		}
+		right = append([]seg{{"overdue", t.C("warn"), false}}, right...)
+	}
+	rx := end - segsWidth(right)
+	cx := c.TextBold(tx, y, threadID(cl.h.Owner), theme.Default.AgentColour(kindOf(cl.h.Owner)))
+	// The reason is another agent's text: drawn, clipped, never parsed. It is the
+	// line's longest part and the first to give way.
+	if why := cl.h.Why; why != "" && rx-detailGap-(cx+detailGap) >= 8 {
+		c.Text(cx+detailGap, y, theme.Clip(why, rx-detailGap-(cx+detailGap)), t.C("main_fg"))
+	}
+	if rx > cx+detailGap {
+		for _, sg := range right {
+			rx = c.Text(rx, y, sg.text, sg.fg)
+		}
+	}
+}
+
+// detailBox draws one device: who holds it on the first line, three gauges with
+// their readings under it, the process table below them, and the device's history
+// down the right side beside both.
+func detailBox(c *Canvas, x, y, w, h int, g wire.Gpu, hist []float64, procs []wire.Proc, missing bool, cols []int, s *theme.Skin, buf []theme.Cell, cl claim) {
 	t := s.Theme
 	label, value, unit := t.C("graph_text"), t.C("main_fg"), t.C("graph_text")
 	// A device the latest sample omitted keeps its last process list; say so, or
 	// the list reads as current.
-	sub, border := plural(len(procs), "proc"), s.Hue.Frame
+	border := s.Hue.Frame
+	var right []seg
 	if missing {
-		sub, border = "not reported · "+plural(len(procs), "proc")+" last seen", s.Hue.Warn
-	}
-	subFG := t.C("graph_text")
-	if missing {
-		subFG = t.C("hi_fg")
-	}
-	// The ledger answer takes the title's right end: it is the one fact here that
-	// is not a measurement, and it is what a reader opens this box to find.
-	right := []seg{{sub, subFG, false}}
-	if holder != nil {
-		// The holder's name takes its agent's brand colour, the same one its lamp
-		// on the card carries. The label before it stays in the label grey: "held"
-		// is a word, the name is the identity, and only the identity has a colour
-		// of its own. Drawing the whole segment in the old "ok" green put a claim
-		// in the host-health colour.
-		label := "held · "
-		if holder.Overdue {
-			label = "overdue · "
-		}
-		name := ledgerCell(*holder, true)
-		fg := theme.Default.AgentColour(ownerKind(holder.Owner))
-		if holder.Overdue {
-			fg = t.C("warn")
-		}
-		right = []seg{{label, t.C("graph_text"), false}, {name, fg, true}}
+		border = s.Hue.Warn
+		right = []seg{{"not reported · processes last seen", t.C("hi_fg"), false}}
 	}
 	c.titledBox(x, y, w, h, border,
 		[]seg{{fmt.Sprintf("%d · %s", g.Index, theme.ShortGPU(g.Name)), t.C("title"), true}},
 		right)
 
 	x0, xr := x+2, x+w-2 // the content's edges
+	claimLine(c, x0, y+1, xr-x0, cl, len(procs) > 0, t)
+
 	// readingX is where the reading columns start: after the label, the gauge
 	// and its percentage.
 	readingX := x0 + detailLabelW + detailBarW + 1 + pctW + detailGap
-	// row draws a gauge and its readings, each a value and its unit, in the
-	// reading columns. A reading that would reach the border is left out whole.
-	row := func(r int, name string, pct float64, sc theme.RGBScale, readings ...[2]string) {
-		yy := y + 1 + r
+	// row draws a gauge and its readings in the reading columns, each a value in
+	// its own colour and a dimmer unit. A reading that would reach the border is
+	// left out whole.
+	row := func(r int, name string, pct float64, sc theme.RGBScale, readings ...reading) {
+		yy := y + 2 + r
 		c.Text(x0, yy, name, label)
 		cx := x0 + detailLabelW
 		px := cx + detailBarW + 1
@@ -495,22 +601,36 @@ func detailBox(c *Canvas, x, y, w, h int, g wire.Gpu, hist []float64, procs []wi
 			}
 			writePct(c, px, yy, v, sc.At(float64(v)), t)
 		}
-		vx := readingX
-		for i, rd := range readings {
-			if i >= len(cols) {
+		vx, col, end := readingX, 0, readingX
+		for _, rd := range readings {
+			v, u, fg := rd.v, rd.u, rd.fg
+			if v == "—" {
+				fg, u = t.C("inactive_fg"), ""
+			}
+			if rd.follow {
+				// Part of the reading before it, a space after it, inside the
+				// same column.
+				if v != "" && col > 0 && end+1+theme.RuneWidth(v)+theme.RuneWidth(u) <= xr {
+					ux := c.Text(end+1, yy, v, fg)
+					end = c.Text(ux, yy, u, unit)
+				}
+				continue
+			}
+			if col >= len(cols) {
 				break
 			}
-			v, u := rd[0], rd[1]
-			if theme.RuneWidth(v)+theme.RuneWidth(u) > cols[i] {
+			if theme.RuneWidth(v)+theme.RuneWidth(u) > cols[col] {
 				// Only an absurd reading is wider than its column. Cut it, unit
 				// first, rather than run into the next one.
-				v, u = theme.Clip(v, cols[i]), ""
+				v, u = theme.Clip(v, cols[col]), ""
 			}
+			end = vx
 			if v != "" && vx+theme.RuneWidth(v)+theme.RuneWidth(u) <= xr {
-				ux := c.Text(vx, yy, v, value)
-				c.Text(ux, yy, u, unit)
+				ux := c.Text(vx, yy, v, fg)
+				end = c.Text(ux, yy, u, unit)
 			}
-			vx += cols[i] + detailGap
+			vx += cols[col] + detailGap
+			col++
 		}
 	}
 
@@ -525,79 +645,108 @@ func detailBox(c *Canvas, x, y, w, h int, g wire.Gpu, hist []float64, procs []wi
 	if g.Power == nil || g.PowerCap == nil || *g.PowerCap <= 0 {
 		pwr = -1
 	}
+	tempFG := value
+	if g.Temp != nil {
+		tempFG = t.Temp(*g.Temp)
+	}
+	// Each gauge carries the readings about the same thing, so a row reads as one
+	// fact: the compute clock and the link beside utilisation, used of total and
+	// the memory clock beside VRAM, and the watts with the heat they make — the
+	// temperature and the fan — beside power. The first column is each gauge's own
+	// absolute reading, in the gauge's colour where it has one.
+	//
 	// A reading the card does not report is left out rather than printed as a
 	// dash in every box: a column of "— MEM" says nothing about this host, and
 	// the width it takes is the history's.
-	row(0, "util", g.UtilPct(), s.Scale.CPU, [2]string{fmtMHz(g.ClockSM), " SM"}, [2]string{fmtTemp(g.Temp), ""}, [2]string{fmtFan(g.Fan), ""})
-	row(1, "vram", mem, s.Scale.VRAM, [2]string{fmtMem(g.MemUsed, g.MemTotal), ""}, dropUnknown([2]string{fmtMHz(g.ClockMem), " MEM"}))
-	row(2, "power", pwr, s.Scale.Power, [2]string{fmtPower(g.Power, g.PowerCap), ""}, dropUnknown([2]string{fmtPCIe(g.PcieGen, g.PcieWide), ""}))
+	row(0, "util", g.UtilPct(), s.Scale.CPU,
+		reading{v: fmtMHz(g.ClockSM), u: " SM", fg: value},
+		reading{v: fmtPCIe(g.PcieGen, g.PcieWide), fg: value})
+	row(1, "vram", mem, s.Scale.VRAM,
+		reading{v: fmtMem(g.MemUsed, g.MemTotal), fg: s.Scale.VRAM.At(max(mem, 0))},
+		dropUnknownReading(reading{v: fmtMHz(g.ClockMem), u: " MEM", fg: value}))
+	row(2, "power", pwr, s.Scale.Power,
+		reading{v: fmtPower(g.Power, g.PowerCap), fg: s.Scale.Power.At(max(pwr, 0))},
+		reading{v: fmtTemp(g.Temp), fg: tempFG},
+		reading{v: fmtFan(g.Fan), fg: value, follow: true})
 
-	// History beside the gauges and the process table, from the box's first row
-	// to its last, so its floor is the box's bottom rather than the middle of it.
-	// The process table's command column stops a gap short of it.
+	// Process table columns. Its column names are in the bottom border under
+	// their columns, the way the board names its own: a header row of its own
+	// made every box a line taller and, on an idle card, was a row of names over
+	// nothing.
+	pidX := x0
+	userX := pidX + procPidW + detailGap
+	memX := userX + procUserW + detailGap
+	cmdX := x0 + procCmdDX
+
+	// History down the right side, beside the gauges and the process table, so its
+	// floor is the box's bottom rather than the middle of it. The claim line runs
+	// above it: the reason is the line's longest part and needs the whole width.
+	// It starts after the last reading, and never before a command has room to be
+	// read: a graph that took the cells cut every job name to a stub.
 	gx := readingX
 	for _, cw := range cols {
 		gx += cw + detailGap
 	}
+	gx = max(gx, cmdX+minCmdW+detailGap)
+	bottom := y + h - 1
 	cmdEnd := xr
+	graphed := false
 	if gw := xr - gx; gw >= 12 {
-		rows := theme.Graph(t, hist, gw, h-2, "", theme.GraphOpts{NoZero: true, Scale: &s.Scale.CPU})
+		rows := theme.Graph(t, hist, gw, h-3, "", theme.GraphOpts{NoZero: true, Scale: &s.Scale.CPU})
 		for r := range rows {
 			for i, cell := range rows[r] {
-				c.Put(gx+i, y+1+r, cell.Text, cell.FG)
+				c.Put(gx+i, y+2+r, cell.Text, cell.FG)
 			}
 		}
-		cmdEnd = gx - detailGap
+		cmdEnd, graphed = gx-detailGap, true
 	}
 
-	// Process table.
-	py := y + 1 + detailGraphH
-	const pidW, userW, memW = 7, 12, 7
-	pidX := x0
-	userX := pidX + pidW + detailGap
-	memX := userX + userW + detailGap
-	cmdX := memX + memW + detailGap
-	c.TextRight(pidX+pidW, py, "Pid", label)
-	c.Text(userX, py, "User", label)
-	c.TextRight(memX+memW, py, "VRAM", label)
-	c.Text(cmdX, py, theme.Clip("Command", cmdEnd-cmdX), label)
-	py++
+	py := y + 2 + detailGauges
+	if graphed {
+		c.legendLabel(gx, bottom, "util history", s)
+	}
 	if len(procs) == 0 {
 		msg := "no processes"
 		if g.ProcsStale {
 			msg = "process list not sampled"
 		}
-		c.Text(cmdX, py, theme.Clip(msg, cmdEnd-cmdX), t.C("graph_text"))
+		c.Text(x0, py, theme.Clip(msg, cmdEnd-x0), t.C("graph_text"))
 		return
 	}
+	c.legendLabel(pidX+procPidW-len("pid"), bottom, "pid", s)
+	c.legendLabel(userX, bottom, "user", s)
+	c.legendLabel(memX+procMemW-len("vram"), bottom, "vram", s)
+	end := c.legendLabel(cmdX, bottom, "command", s)
 	list := procs
 	if len(list) > maxProcs {
 		list = list[:maxProcs]
 	}
 	for _, p := range list {
-		c.TextRight(pidX+pidW, py, fitExact(fmt.Sprint(p.PID), pidW), t.C("graph_text"))
+		c.TextRight(pidX+procPidW, py, fitExact(fmt.Sprint(p.PID), procPidW), t.C("graph_text"))
 		// The owner is text, not a state: saturated green said "healthy" about a
 		// user name.
-		c.Text(userX, py, theme.Clip(p.User, userW), t.C("main_fg"))
+		c.Text(userX, py, theme.Clip(p.User, procUserW), t.C("main_fg"))
 		if p.MemMB > 0 {
 			pct := 0
 			if g.MemTotal != nil && *g.MemTotal > 0 {
 				pct = int(float64(p.MemMB) / float64(*g.MemTotal) * 100)
 			}
-			c.TextRight(memX+memW, py, fitExact(theme.MiB(p.MemMB), memW), s.Scale.VRAM.At(float64(50+pct/2)))
+			c.TextRight(memX+procMemW, py, fitExact(theme.MiB(p.MemMB), procMemW), s.Scale.VRAM.At(float64(50+pct/2)))
 		} else {
 			// Some drivers report per-process VRAM as 0 while the device is full.
 			// Printing "0M" would state a measurement never taken.
-			c.TextRight(memX+memW, py, "—", t.C("inactive_fg"))
+			c.TextRight(memX+procMemW, py, "—", t.C("inactive_fg"))
 		}
 		c.Text(cmdX, py, theme.Clip(p.Name, cmdEnd-cmdX), t.C("main_fg"))
 		py++
 	}
 	if rest := len(procs) - len(list); rest > 0 {
-		// Say what is not shown, on the box's bottom border under the command
-		// column: a silently truncated list reads as a card with three jobs on it,
-		// and a row of its own would make every busy box a line taller.
-		c.lineLabel(cmdX, y+h-1, fmt.Sprintf("+%d more", rest), t.C("graph_text"))
+		// Say what is not shown, in the bottom border after the command column's
+		// name: a silently truncated list reads as a card with three jobs on it.
+		more := fmt.Sprintf("+%d more", rest)
+		if x := end + 1; !graphed || x+theme.RuneWidth(more) < gx-1 {
+			c.lineLabel(x, bottom, more, t.C("graph_text"))
+		}
 	}
 }
 
@@ -704,11 +853,20 @@ func dedupeProcs(ps []wire.Proc) []wire.Proc {
 	return out
 }
 
-// dropUnknown is a reading with itself cleared when the card did not report it,
-// so the column it would sit in collapses.
-func dropUnknown(r [2]string) [2]string {
-	if r[0] == "—" {
-		return [2]string{}
+// reading is one value in a device box's reading columns: the number, its unit,
+// and the number's colour. A reading that follows is part of the one before it
+// and shares its column ("40°C fan 30%").
+type reading struct {
+	v, u   string
+	fg     theme.RGB
+	follow bool
+}
+
+// dropUnknownReading is a reading with itself cleared when the card did not
+// report it, so the column it would sit in collapses.
+func dropUnknownReading(r reading) reading {
+	if r.v == "—" {
+		return reading{}
 	}
 	return r
 }
@@ -806,8 +964,8 @@ func procCanvas(c *Canvas, a *App, h *hostState, s *theme.Skin) {
 			}
 			p := list[j]
 			y := 3 + i
-			c.TextRight(px+pidW, y, fitExact(fmt.Sprint(p.PID), pidW), label)
-			c.Text(ux, y, theme.Clip(p.User, userW), value)
+			c.TextRight(px+pidW, y, fitExact(fmt.Sprint(p.PID), procPidW), label)
+			c.Text(ux, y, theme.Clip(p.User, procUserW), value)
 			c.TextRight(rx+rssW, y, fitExact(theme.MiB(p.RSSKB/1024), rssW), t.C("main_fg"))
 			if p.CPUPct == nil {
 				c.TextRight(cpuX+cpuW, y, "—", t.C("inactive_fg"))

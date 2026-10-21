@@ -86,19 +86,29 @@ func TestNoLedgerKeepsTheBoardUnchanged(t *testing.T) {
 }
 
 // TestDetailBoxShowsTheHolder: the board's footer summarises; the detail view has
-// room for the card's own holder and its deadline state.
+// room for the card's own holder — its thread, not its runtime's name — and its
+// deadline state.
 func TestDetailBoxShowsTheHolder(t *testing.T) {
 	a := fixtureWithUUIDs(160, 40, 2)
 	a.Deliver(LedgerMsg{
 		At:      time.Now(),
-		Holders: map[string]Holder{"GPU-a": {Owner: "agent-a/x", Overdue: true}},
+		Holders: map[string]Holder{"GPU-a": {Owner: "agent-a/5d1e0c97", Overdue: true}},
 	})
 	a.open("hosta")
 	a.mu.Lock()
 	frame := a.detailCanvas().Plain()
 	a.mu.Unlock()
-	if !strings.Contains(frame, "overdue · agent-a") {
-		t.Fatalf("detail box does not show the holder:\n%s", frame)
+	line := ""
+	for _, l := range strings.Split(frame, "\n") {
+		if strings.Contains(l, "5d1e0c97") {
+			line = l
+		}
+	}
+	if line == "" || !strings.Contains(line, "overdue") {
+		t.Fatalf("detail box does not show the holder's thread and its deadline:\n%s", frame)
+	}
+	if strings.Contains(line, "agent-a") {
+		t.Errorf("the claim line names the runtime instead of the thread: %q", line)
 	}
 }
 

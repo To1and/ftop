@@ -7,8 +7,21 @@ import (
 	"strings"
 	"time"
 
+	"ftop/internal/demo"
 	"ftop/internal/wire"
 )
+
+// DemoLedger is the demo fleet's ledger as the board receives it, read at at.
+// The demo has no database: its claims are stated, and delivered once.
+func DemoLedger(at time.Time) LedgerMsg {
+	holders := map[string]Holder{}
+	for _, c := range demo.Claims() {
+		holders[demo.UUID(c.Host, c.GPU)] = Holder{
+			Owner: c.Owner, Why: c.Why, Since: at.Add(-c.Age), Overdue: c.Overdue,
+		}
+	}
+	return LedgerMsg{At: at, Holders: holders}
+}
 
 // FleetJSON is the snapshot shape the design prototypes render from.
 //
