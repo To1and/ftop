@@ -27,7 +27,7 @@ told apart by colour alone.)
 ## Install
 
 ```bash
-brew install --cask To1and/tap/ftop
+brew install To1and/tap/ftop
 ```
 
 Or from source:

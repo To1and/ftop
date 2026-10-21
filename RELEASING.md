@@ -13,8 +13,13 @@ archives to a GitHub release, and writes `Casks/ftop.rb` into
 `To1and/homebrew-tap`. Users install with:
 
 ```bash
-brew install --cask To1and/tap/ftop
+brew install To1and/tap/ftop
 ```
+
+The tap has to be named: Homebrew refuses to load a cask from a third-party tap
+until it is trusted, and a fully qualified install trusts that cask, so
+`brew tap To1and/tap && brew install ftop` stops at the trust check. `--cask`
+is not needed because the tap has no formula called ftop.
 
 ## The two-step build
 
