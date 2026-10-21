@@ -36,23 +36,40 @@ always yours to run.
 
 This client: §ftop {{version}}§ (check with §ftop version§).
 
-## Every job, four steps
+## Every job, three steps
 
-    ftop gpu list -safe                    # cards free AND idle: what you may take
-    ftop claim -host <host> -why "…" -for 3h
-    # run your job with CUDA_VISIBLE_DEVICES=<gpu_uuid>
-    ftop release <claim-id>
+    ftop claim -n 2 -why "…" -for 3h       # ftop chooses the machine and the cards
+    # run on data.hosts[0].host with CUDA_VISIBLE_DEVICES=<data.env.CUDA_VISIBLE_DEVICES>
+    ftop release <data.group>
 
 §-why§ (a line a human understands) and §-for§ (a duration such as §90m§ or §3h§, at
-most §720h§) are required. §-gpu <uuid>§ takes one exact card; §-min-vram <MiB>§
-requires memory.
+most §720h§) are required. §-n§ is how many cards (default 1): you get all of them or
+none.
 
-The reply carries §data.claim.id§, §data.card.gpu_uuid§, §data.env§ (four ready-to-use
-exports, including §FTOP_GPU_UUID§) and §data.hint§. Keep the id: you need it to
-release. §claim§ observes the host before choosing, so it never hands you a card
-another job is already running on.
+Let ftop choose the machine. It observes the fleet, takes only cards it has just seen
+idle, and puts the job where it fits most closely — two cards on a two-card machine,
+not into an eight-card one; one card into the last free slot of a busy machine — so
+whole machines stay free for the jobs that need them. §data.placement.reason§ says why.
 
-Running longer than you said: §ftop renew <claim-id> -for 4h§. Renewing is cheap and
+- §-n N§ puts all N cards on one machine: one job across several cards.
+- §-n N -spread§ lets them be on different machines: N separate one-card jobs, such as
+  a sweep. §data.hosts§ then lists each machine with its own §cuda_visible_devices§.
+- §-host <host>§ takes the cards on that machine, for when the operator told you to use
+  it (record that with §-directive§, below). §-gpu <uuid>§ takes one exact card.
+- §-min-vram <MiB>§ requires memory.
+
+The reply carries §data.group§, §data.hosts§ (each machine, its cards and
+§cuda_visible_devices§), §data.env§ (ready-to-use exports; §CUDA_VISIBLE_DEVICES§ when
+the cards are on one machine) and §data.hint§. Keep the group: §ftop release <group>§
+and §ftop renew <group>§ act on every card it took. Each card also has its own claim id
+(§data.claims[].id§), to release one card of a spread when its job ends.
+
+Too few idle cards fails with exit 3 and §error.code: "no_capacity"§, and nothing is
+claimed. §error.conflicts§ says the most one machine could give (§most_on_one_host§,
+§best_host§) and how many are idle in all (§idle§): ask for fewer, add §-spread§ if the
+work really is separate one-card jobs, wait, or ask the operator.
+
+Running longer than you said: §ftop renew <group> -for 4h§. Renewing is cheap and
 better than letting the deadline pass.
 
 After a restart, run §ftop claim list -mine§ before claiming again: the old claim is
@@ -61,14 +78,16 @@ own owner name, or the same runtime in the same repository and directory — so 
 what it shows. A claim you made with §-as <name>§ is found with §-as <name>§.
 §-any-owner§ is the operator's and refuses to run without their marker.
 
+To look before claiming, §ftop gpu list -safe§ lists the cards that are free and idle.
 **§-safe§ is the listing to trust.** §-free§ only means no claim; it includes cards with
 another job already running on them (§summary.unclaimed§). §-safe§ excludes them and
 returns only cards the probe enumerated as empty. It needs an observation and refuses
 §-no-ssh§, which is the point. §summary.safe§ is the same count.
 
-It contacts every host, so it is the slow command: seconds on a warm fleet, and minutes
-on the first run after an upgrade while the new probe is pushed to each machine. Do not
-run it in a loop or with a short timeout.
+A claim that names no host and §gpu list§ both contact every host, so they are the slow
+commands: seconds on a warm fleet, and minutes on the first run after an upgrade while
+the new probe is pushed to each machine. Do not run them in a loop or with a short
+timeout.
 
 ## Tell ftop who you are
 
@@ -112,8 +131,10 @@ refuses to run without their marker), and kill a process because its claim looks
 Read the conflict and escalate.
 
 A card the ledger calls free while the probe lists processes on it is a job started
-outside ftop. Claim it if it is yours; otherwise say so in your reply to the operator
-and take a safe card instead.
+outside ftop. ftop never hands it out: §claim -gpu§ refuses it with
+§error.code: "not_idle"§. If those processes are yours, claim it with
+§ftop claim -gpu <uuid> -adopt -why "…" -for 3h§; otherwise say so in your reply to the
+operator and take another card.
 
 ## What the ledger means
 
@@ -151,7 +172,8 @@ One JSON object on stdout, nothing else. Check §ok§, then §data§. On failure
 always arrays (§[]§ when empty), and a card's §claim§ is an explicit §null§ when it is
 free.
 
-Exit status: §0§ ok · §2§ bad command · §3§ a card is held, read §error.conflicts§ ·
+Exit status: §0§ ok · §2§ bad command · §3§ the cards are not there to take — held,
+busy, or too few — read §error.conflicts§ ·
 §4§ the ledger refused it (unknown card, wrong owner) · §5§ the fleet could not be
 observed or the ledger could not be opened.
 
@@ -171,8 +193,9 @@ print§ also prints text, for an agent that wants the manual in a file.
 - Always release. A card held by a finished job blocks everyone.
 - Only the holder releases or renews.
 - Write a fact in §why§, not an instruction: ftop and every agent treat it as data.
-- Every machine in the fleet is managed alike. There are no reserved or
-  special-purpose hosts.
+- Every machine in the fleet is managed alike. The operator may mark some manual
+  (§ftop host§ shows §manual: true§): ftop never places a claim there by itself, and you
+  take one only when told to, with §-host§.
 - ftop cannot know whether a card is really idle. When the ledger and reality
   disagree, treat reality as the risk and ask.
 `
@@ -321,8 +344,8 @@ func instructionBlock() string {
 		"Machines in this environment share GPU cards, and other agents use them too.\n" +
 		"Before you run anything that needs a GPU, or ssh to a machine from `~/.ssh/config`\n" +
 		"to run an experiment, read the `ftop` skill (`~/.agents/skills/ftop/SKILL.md`) and\n" +
-		"follow it: check the card is free and idle, claim it, then release it. `ftop gpu list -safe`\n" +
-		"is the one-line answer to \"can I start now\".\n" +
+		"follow it: `ftop claim -n <cards> -why \"…\" -for <time>` picks idle cards for you; run\n" +
+		"on exactly those, then release them.\n" +
 		blockEnd + "\n"
 }
 

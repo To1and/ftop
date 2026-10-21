@@ -177,6 +177,9 @@ drop     = ["my-laptop"]
 
 [labels]
 "lab-node-1" = "node-a"
+
+[claim]
+manual = ["my-workstation"]   # monitored and claimable by name, never chosen
 ```
 
 `drop` matches the ssh alias, the card label or the HostName, with wildcards.
@@ -190,22 +193,35 @@ and a section ftop does not know can no longer be read as another `[[host]]`.
 
 ## For agents: the ledger
 
-ftop records who holds which GPU card and why. It never starts, stops or kills
-anything — that is the agent's job — so the ledger is a record, not a scheduler.
-Agents reach the GPU hosts over ssh, so one SQLite database on the machine the
-agents run on can be the single authority, and watching a card needs nothing
-installed on the hosts.
+ftop records who holds which GPU card and why, and chooses which idle cards a
+claim gets when the agent does not name them. It never starts, stops or kills
+anything — running the job is the agent's business. Agents reach the GPU hosts
+over ssh, so one SQLite database on the machine the agents run on can be the
+single authority, and watching a card needs nothing installed on the hosts.
 
 ```sh
-ftop gpu list -safe                  # cards free AND idle: what to take
+ftop claim -n 2 -why "train ~3h" -for 3h      # ftop picks the machine: the closest fit
+ftop claim -n 8 -spread -why "sweep" -for 3h  # 8 separate one-card jobs, any machines
+ftop claim -host <host> -n 2 -why "…" -for 3h # on the machine the operator named
+ftop release G20260101T120000-1a2b3c4d        # every card the claim took
+ftop gpu list -safe                  # cards free AND idle
 ftop gpu list -free                  # cards with no claim (may be busy)
-ftop claim -host <host> -why "train ~3h" -for 3h
-ftop release L20260101T120000-1a2b3c4d
 ftop gpu why                         # one line per card: who, and why
 ftop history <gpu-uuid>              # who had it before, and how it ended
 ftop skill install                   # manual into ~/.agents/skills, linked everywhere
 ftop whoami                          # the identity ftop will record for you
 ```
+
+A claim that names no host observes the fleet and puts the cards on the machine
+they fit most closely: the fewest idle cards left over, then a machine already
+partly in use, then the smaller machine. Two cards go to a two-card machine rather
+than into an eight-card one, and a single card fills the last free slot of a busy
+machine before it opens an idle one, so whole machines stay free for the jobs that
+need them. The cards are all on one machine unless `-spread` says they are
+separate jobs, and the claim takes all of them or none: too few idle cards is
+`no_capacity`, with the most one machine and the fleet could give. Hosts listed
+under `[claim] manual` in config.toml are monitored and claimable by name, but
+never chosen.
 
 `ftop skill install` writes the manual once and links it into every agent runtime
 present on the machine — `~/.claude/skills`, `~/.codex/skills`, `~/.cursor/skills`,
@@ -238,10 +254,14 @@ Rules enforced rather than documented:
   crash between the check and the insert cannot double-book a card. Every
   transaction takes the write lock up front, so two agents claiming at once get
   one success and one `held`, never a lock error.
+- **Only idle cards are handed out**, named ones included: claim observes first,
+  a card with processes nobody claimed is `not_idle` (`-adopt` takes it when the
+  processes are yours), and a claim that could not observe is `no_observation`
+  rather than a card nobody looked at. `-no-ssh` is the explicit way to choose
+  from the ledger alone.
 - **A deadline is not an eviction.** An overdue claim keeps its card. It is
-  closed only when `gpu list` or `gpu show` observes that card and the probe
-  enumerated its processes and found none; a process list that could not be
-  read is never read as "idle".
+  closed only when `claim`, `gpu list` or `gpu show` observes that card idle; a
+  process list that could not be read is never read as "idle".
 - **Only the holder releases.** An agent's identity is `<agent>/<session>`; a
   restarted agent of the same kind may release its own earlier claims, another
   kind may not. `release -any-owner` is the operator's override and is recorded

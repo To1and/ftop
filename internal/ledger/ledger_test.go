@@ -225,7 +225,7 @@ func TestSweepReleasesOnlyWhenObservedIdle(t *testing.T) {
 
 	// Enumerated and empty: genuinely idle.
 	released, kept, err := s.Sweep(map[string]Observation{
-		res.Claim.GPUUUID: {Procs: 0, ProcsKnown: true},
+		res.Claim.GPUUUID: {Procs: 0, ProcsKnown: true, MemKnown: true},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -294,7 +294,7 @@ func TestAnnotateIgnoresDriverOverhead(t *testing.T) {
 		{MemUsedMiB: 587, MemTotalMiB: 32607, UnattributedMiB: 587},
 		{MemUsedMiB: 458, MemTotalMiB: 24564, UnattributedMiB: 458},
 	} {
-		ob.ProcsKnown = true
+		ob.ProcsKnown, ob.MemKnown = true, true
 		views := []CardView{{Card: Card{Host: "h", GPUUUID: "u", MemTotal: ob.MemTotalMiB}}}
 		Annotate(views, map[string]Observation{"u": ob})
 		if views[0].Conflict != "" {
@@ -308,7 +308,7 @@ func TestAnnotateIgnoresDriverOverhead(t *testing.T) {
 func TestAnnotateFlagsRealUnattributedUse(t *testing.T) {
 	views := []CardView{{Card: Card{Host: "h", GPUUUID: "u", MemTotal: 24564}}}
 	Annotate(views, map[string]Observation{
-		"u": {Procs: 0, ProcsKnown: true, MemUsedMiB: 12000, MemTotalMiB: 24564, UnattributedMiB: 12000},
+		"u": {Procs: 0, ProcsKnown: true, MemKnown: true, MemUsedMiB: 12000, MemTotalMiB: 24564, UnattributedMiB: 12000},
 	})
 	if views[0].Conflict == "" {
 		t.Fatal("12 GiB unattributed on an idle card must be flagged")
@@ -321,7 +321,7 @@ func TestAnnotateFlagsRealUnattributedUse(t *testing.T) {
 func TestAnnotateReportsUnclaimedWork(t *testing.T) {
 	views := []CardView{{Card: Card{Host: "h", GPUUUID: "u", MemTotal: 24564}}}
 	Annotate(views, map[string]Observation{
-		"u": {Procs: 2, ProcsKnown: true, MemTotalMiB: 24564, UnattributedMiB: 8000},
+		"u": {Procs: 2, ProcsKnown: true, MemKnown: true, MemTotalMiB: 24564, UnattributedMiB: 8000},
 	})
 	if views[0].Conflict == "" {
 		t.Fatal("a free card with running processes must be flagged")
@@ -758,8 +758,8 @@ func TestClaimNeverPicksAnUnclaimedBusyCard(t *testing.T) {
 	r := req("h", "agent-a")
 	r.RequireIdle = true
 	r.Observed = map[string]Observation{
-		"h-gpu0": {Procs: 2, ProcsKnown: true}, // busy, nobody claimed
-		"h-gpu1": {Procs: 0, ProcsKnown: true}, // idle
+		"h-gpu0": {Procs: 2, ProcsKnown: true, MemKnown: true}, // busy, nobody claimed
+		"h-gpu1": {Procs: 0, ProcsKnown: true, MemKnown: true}, // idle
 		// h-gpu2 not enumerated: unknown, and unknown is not idle.
 	}
 	res, err := s.Claim(r)
@@ -774,8 +774,8 @@ func TestClaimNeverPicksAnUnclaimedBusyCard(t *testing.T) {
 	r2 := req("h", "agent-b")
 	r2.RequireIdle = true
 	r2.Observed = map[string]Observation{
-		"h-gpu0": {Procs: 1, ProcsKnown: true},
-		"h-gpu2": {Procs: 3, ProcsKnown: true},
+		"h-gpu0": {Procs: 1, ProcsKnown: true, MemKnown: true},
+		"h-gpu2": {Procs: 3, ProcsKnown: true, MemKnown: true},
 	}
 	_, err = s.Claim(r2)
 	if !errors.Is(err, ErrNoSuchCard) {

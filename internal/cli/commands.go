@@ -155,9 +155,11 @@ func runHost(io_ IO, args []string) int {
 		Host    string `json:"host"`
 		Label   string `json:"label,omitempty"`
 		Managed bool   `json:"managed"`
-		Cards   int    `json:"cards"`
-		Free    int    `json:"free"`
-		Held    int    `json:"held"`
+		// Manual hosts are never chosen by a claim that names no host.
+		Manual bool `json:"manual,omitempty"`
+		Cards  int  `json:"cards"`
+		Free   int  `json:"free"`
+		Held   int  `json:"held"`
 	}
 	rows := map[string]*hostRow{}
 	var names []string
@@ -176,7 +178,7 @@ func runHost(io_ IO, args []string) int {
 	if cfg, err := config.Load(expandHome(*cfgPath)); err == nil {
 		for _, h := range cfg.Hosts {
 			r := row(h.Name)
-			r.Label, r.Managed = h.Label, true
+			r.Label, r.Managed, r.Manual = h.Label, true, h.Manual
 		}
 	} else if *cfgPath != "" {
 		return emitErr(io_.Out, "host", usageErr("%v", err))
@@ -222,9 +224,12 @@ before it starts.
   ftop gpu list [-host H] [-safe|-free|-held] [-no-ssh]
   ftop gpu show <uuid|host:index>
   ftop gpu why [-host H]      one line per card: who holds it, and why
-  ftop claim -host H -why "…" -for 2h [-gpu UUID] [-min-vram MIB] [-directive "…"]
-  ftop release <claim-id>
-  ftop renew <claim-id> -for 4h
+  ftop claim -why "…" -for 2h [-n N] [-spread] [-min-vram MIB] [-directive "…"]
+                              ftop chooses where: the closest fit, all N or none
+  ftop claim -host H -why "…" -for 2h [-n N]     on that machine
+  ftop claim -gpu UUID -why "…" -for 2h [-adopt] that card
+  ftop release <group|claim-id>
+  ftop renew <group|claim-id> -for 4h
   ftop claim list [-mine]
   ftop history <gpu-uuid> [-n 20]
   ftop host                   every machine, its label, and its free cards
@@ -233,18 +238,23 @@ before it starts.
                               install the agent manual and point every agent at it
 
 Every command prints JSON on stdout. Errors carry a stable "code"; exit status
-3 means someone else holds the card and "conflicts" names them.
+3 means the cards are not there to take (held, busy, or too few) and
+"conflicts" says by whom or how many.
 
 Rules that matter:
-  - take a card with "gpu list -safe", claim it with a reason, release when done:
-    -free includes cards another job is already running on
+  - let ftop choose the cards: it takes only cards it has just seen idle, and
+    keeps whole machines free for jobs that need them. Release when done.
+  - "gpu list -safe" lists what is free and idle; -free includes cards another
+    job is already running on
   - if ftop cannot tell which agent you are, it refuses the claim: set FTOP_AGENT
     (and FTOP_SESSION) in your own instructions, or pass -as <name>
   - never take a card another agent holds; read the conflict and decide
   - a card the ledger calls free but the probe sees busy is someone's job
-    started outside ftop: claim it or ask the operator, do not kill it
+    started outside ftop: claim it with -gpu UUID -adopt if it is yours, or
+    ask the operator; do not kill it
   - every machine in ~/.ssh/config is managed alike; leave one out with
-    drop in config.toml
+    drop in config.toml, or keep claims off it unless named with
+    [claim] manual
 `
 
 // indent is used by the skill renderer.

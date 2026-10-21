@@ -18,6 +18,9 @@ type Observation struct {
 	UtilPct     float64   `json:"util_pct"`
 	MemUsedMiB  uint64    `json:"mem_used_mib,omitempty"`
 	MemTotalMiB uint64    `json:"mem_total_mib,omitempty"`
+	// MemKnown is false when the driver did not report used memory. Then the
+	// unattributed figure is not zero, it is unknown, and the card is not idle.
+	MemKnown bool `json:"mem_known"`
 	// MemReservedMiB is the driver's own reservation, which MemUsedMiB does not
 	// include. Nil when the driver only answers the v1 query: then MemUsedMiB is
 	// total minus free and the reservation is inside it.
@@ -133,7 +136,7 @@ func (s *Store) List(opt ListOptions) ([]CardView, error) {
 	q := `SELECT c.gpu_uuid, c.host, c.idx, c.name, c.mem_total, c.first_seen, c.last_seen,
 		c.present,
 		k.id, k.owner, k.session, k.repo, k.branch, k.cwd, k.why, k.note, k.directive,
-		k.created_ns, k.updated_ns, k.expires_ns, k.closed, k.close_cause, k.closed_ns
+		k.created_ns, k.updated_ns, k.expires_ns, k.closed, k.close_cause, k.closed_ns, k.grp
 		FROM cards c
 		LEFT JOIN claims k ON k.gpu_uuid = c.gpu_uuid AND k.closed = 0`
 	var args []any
@@ -171,10 +174,11 @@ func (s *Store) List(opt ListOptions) ([]CardView, error) {
 			closed   sql.NullInt64
 			cause    sql.NullString
 			closedNS sql.NullInt64
+			group    sql.NullString
 		)
 		if err := rows.Scan(&v.GPUUUID, &v.Host, &v.Index, &v.Name, &v.MemTotal, &fs, &ls,
 			&v.Present, &claimID, &owner, &session, &repo, &branch, &cwd, &why, &note, &direct,
-			&created, &updated, &expires, &closed, &cause, &closedNS); err != nil {
+			&created, &updated, &expires, &closed, &cause, &closedNS, &group); err != nil {
 			return nil, fmt.Errorf("ledger: %w", err)
 		}
 		v.FirstSeen, v.LastSeen = fromNS(fs), fromNS(ls)
@@ -187,7 +191,7 @@ func (s *Store) List(opt ListOptions) ([]CardView, error) {
 				Created: fromNS(created.Int64), Updated: fromNS(updated.Int64),
 				Expires: fromNS(expires.Int64),
 				Closed:  closed.Int64 == 1, CloseCause: cause.String,
-				ClosedAt: fromNS(closedNS.Int64),
+				ClosedAt: fromNS(closedNS.Int64), Group: group.String,
 			}
 			v.Claim = c
 		}
@@ -230,6 +234,22 @@ func UnattributedThreshold(memTotalMiB uint64) int64 {
 	return pct
 }
 
+// Idle reports whether the observation shows nothing on the card: the processes
+// were enumerated, there are none, and no more memory is in use than an idle card
+// shows.
+//
+// It is the one definition of idle. Claim, `gpu list -safe` and Sweep each had their
+// own, and Sweep's ignored unattributed memory, so it could close an overdue claim on
+// a card a hidden job was still using.
+func (o Observation) Idle() bool {
+	return o.ProcsKnown && o.MemKnown && o.Procs == 0 && !o.Hidden()
+}
+
+// Hidden reports memory in use that no process on this host accounts for.
+func (o Observation) Hidden() bool {
+	return o.UnattributedMiB > UnattributedThreshold(o.MemTotalMiB)
+}
+
 // Annotate joins observations onto a listing and states, in one line, how the ledger
 // and the card disagree.
 //
@@ -248,12 +268,13 @@ func Annotate(views []CardView, obs map[string]Observation) {
 		}
 		views[i].Observation = &ob
 		known := ob.ProcsKnown
-		threshold := UnattributedThreshold(ob.MemTotalMiB)
-		hidden := ob.UnattributedMiB > threshold
+		hidden := ob.Hidden()
 
 		switch {
 		case views[i].Claim == nil && !known:
 			views[i].Conflict = "ledger free; process list unavailable, cannot confirm idle"
+		case views[i].Claim == nil && ob.Procs == 0 && !ob.MemKnown:
+			views[i].Conflict = "ledger free; memory reading unavailable, cannot confirm idle"
 		case views[i].Claim == nil && ob.Procs > 0:
 			// Not an error and not a conflict: work is running and nobody wrote down
 			// who owns it. The card stays claimable — that is how the operator wants
@@ -331,6 +352,19 @@ type Event struct {
 	GPUUUID string    `json:"gpu_uuid,omitempty"`
 	Actor   string    `json:"actor,omitempty"`
 	Detail  string    `json:"detail,omitempty"`
+}
+
+// CardHost is the host the ledger last saw a card on, and whether it knows the card.
+func (s *Store) CardHost(uuid string) (string, bool, error) {
+	var host string
+	err := s.db.QueryRow(`SELECT host FROM cards WHERE gpu_uuid = ?`, uuid).Scan(&host)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("ledger: %w", err)
+	}
+	return host, true, nil
 }
 
 // CardCount is how many cards the ledger knows on a host.

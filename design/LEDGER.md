@@ -12,13 +12,22 @@ recommendations).
    business; splitting VRAM is explicitly **not** ftop's job.
 4. ftop **maintains state only**. It starts nothing, runs nothing, kills nothing,
    resets nothing, reboots nothing.
-5. The operator assigns work and arbitrates conflicts; between tasks it is
-   first-come-first-served. Agents are expected to coordinate with each other, and
-   the operator's own instruction wins without needing to be re-confirmed.
-6. A CPU-only claim exists: it occupies a machine's CPU without taking a card.
+5. The operator arbitrates conflicts; between tasks it is first-come-first-served.
+   Agents are expected to coordinate with each other, and the operator's own
+   instruction wins without needing to be re-confirmed. *Revised 2026-10-22* (8):
+   where a claim lands is ftop's choice unless the operator named the place.
+6. A CPU-only claim was decided on: it would occupy a machine's CPU without taking a
+   card. It is not implemented yet.
 7. `ftop skill` is installed into `~/.agents/skills` with the others symlinked to it.
+8. *2026-10-22.* A claim that names no host or card is placed by ftop, among the
+   cards it has just seen idle, so the fleet does not fragment: N cards go on one
+   machine (all or none), `-spread` makes them N independent one-card jobs, too few
+   idle cards fails and says how many there are, and there is no queue. Hosts the
+   operator marks `manual` in config.toml are never chosen, only named.
 
 Decisions 3 and 4 together removed most of the design both reviewers had produced.
+Decision 8 replaced "no scoring, no backfilling, no fairness": choosing among idle
+cards starts and stops nothing, so ftop still maintains state only.
 
 ## Shape
 
@@ -69,6 +78,55 @@ nothing but the probe binary to `~/.cache/ftop/`.
 - **The reason field is data.** It is sanitised of control and bidi characters on the
   way in, and never enters a command line, a SQL string or a shell.
 
+## Placement
+
+Before decision 8 every claim named its host, and agents picked machines the way
+people do: the first one that came to mind. The ledger's history showed the cost —
+of 71 requests (claims by one owner on one host within two minutes), 34 landed on a
+bigger machine while a smaller one that fitted was idle, 16 of them by opening a
+completely idle large machine, and the one two-card machine was never used.
+
+A claim that names nothing now observes every host that is not `manual` and, for N
+cards on one machine, takes the host where they fit most closely:
+
+1. the fewest idle cards left over once these are placed;
+2. then a host already partly in use, so a hole is filled before a whole machine is
+   opened (one card goes into a four-card host with one card left, not into an idle
+   two-card host, which stays whole for a two-card job);
+3. then the host with fewer cards;
+4. then the smaller card memory, so a job that fits the common card does not take the
+   rare large one;
+5. then the name, so one state always gives one answer.
+
+Ranking by the machine's size alone gets the second case wrong, which is why the
+leftover comes first. Within the chosen host the lowest idle indices are taken.
+
+`-spread` places the cards one at a time by the same rule, which fills one-card hosts
+and holes first. It exists because "N cards" means two different things: one job on N
+cards of one machine (the default — a job across machines needs networking ftop knows
+nothing about) and N separate one-card jobs such as a sweep.
+
+Idle means observed idle: enumerated, no processes, and no more memory in use than an
+idle card shows. That one definition (`Observation.Idle`) is used by placement, by a
+named card, by `gpu list -safe` and by `Sweep`, which each used to have their own; a
+named card used to skip the check, and `Sweep` ignored memory no process accounted for.
+
+A claim observes before it chooses, always, and one that could not observe the host
+it names — or any host it may place on — fails as `no_observation`, naming them under
+`unavailable_hosts`. It used to fall back to the ledger whenever the host was already
+known, which in practice meant a build without a probe handed out cards nobody had
+looked at; `-no-ssh` is now the only way to choose from the ledger alone.
+
+The cards are recorded in one transaction under one group id (`G…`, claims are `L…`),
+which `release` and `renew` accept, so a job's cards are let go of and extended
+together. A request that cannot be met records nothing and returns `no_capacity` with
+the most one machine could give and how many are idle in all.
+
+Not solved: a large request can starve. Filling holes keeps whole machines whole as long
+as possible, but under load small jobs eventually open them, and an eight-card machine
+is whole again only when its last claim ends. Fixing that needs queueing and holding a
+draining machine for the large job, which is a larger change than placement.
+
 ## Expiry
 
 A deadline does not release a card. `Sweep` closes an overdue claim only when the
@@ -77,8 +135,10 @@ process is present, the claim stays and is reported `overdue`. The cost of being
 wrong this way is a stuck card a human can see; the cost of the other way is two
 agents writing to one GPU.
 
-`Sweep` runs inside `gpu list` and `gpu show` whenever they observe, because those are
-the only moments ftop has an observation and there is no daemon. In the first commit
+`Sweep` runs inside `claim`, `gpu list` and `gpu show` whenever they observe, because
+those are the only moments ftop has an observation and there is no daemon. Running it
+in `claim` matters most: an abandoned claim used to keep its card from every claim
+until someone happened to list the fleet. In the first commit
 it existed and was tested but had no caller, so a deadline changed nothing; both
 reviewers found that independently.
 
@@ -180,9 +240,14 @@ Each has a regression test that fails on the old code.
 ## Testing
 
 - `internal/config`: the two TOML defects, plus the existing empty-fleet property.
-- `internal/ledger`: 21 tests, including a concurrency test that races 8 claims at one
-  card and requires exactly one winner, and the three expiry cases (no observation,
-  enumeration failed, observed idle).
+- `internal/ledger`: a concurrency test that races 8 claims at one card and requires
+  exactly one winner; the expiry cases (no observation, enumeration failed, observed
+  idle, idle but with memory no process accounts for); placement — the operator's
+  8/4/2 example, filling a hole first, the tie that prefers a partly used host,
+  spread, all-or-nothing, idle-only (unknown memory included), the host list, a
+  named card that is busy, the memory tie-break on the cards actually taken, and a
+  too-small card not counting as use — and groups, and the v2 → v3 migration, alone
+  and with twelve processes opening the old file at once.
 - `internal/cli`: the claim → conflict → release loop, flag-after-positional, stable
   error codes, `unknown` is not `human`, JSON-only stdout, empty lists as `[]`, and
   `owner` as an explicit `null`.
@@ -191,7 +256,8 @@ Each has a regression test that fails on the old code.
 
 ## Not done on purpose
 
-- No queueing, no priority, no preemption.
+- No queueing, no priority, no preemption. A request that cannot be met fails and
+  says what the fleet has.
 - No per-card VRAM reservation.
 - No MCP server. The CLI plus the generated skill is the surface; an MCP adapter would
   be a thin wrapper over the same JSON.

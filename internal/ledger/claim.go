@@ -9,10 +9,26 @@ import (
 )
 
 // ClaimRequest is what an agent asks for.
+//
+// Where the cards come from is one of three things: the exact card named by
+// GPUUUID, idle cards on the host named by Host, or — when neither is given —
+// wherever they fit best (see place).
 type ClaimRequest struct {
-	Host    string
-	GPUUUID string // optional: when empty, any free card on Host is chosen
+	Host    string // optional: take the cards on this host
+	GPUUUID string // optional: take this exact card
+	// Hosts limits automatic placement to these machines; nil leaves every host the
+	// ledger knows. It is ignored when Host or GPUUUID names the place.
+	Hosts []string
+	// Count is how many cards, all or none. Zero means one.
+	Count int
+	// Spread lets automatic placement put the cards on different hosts: separate
+	// one-card jobs rather than one job on several cards. Without it every card is on
+	// one host, because a job across machines needs a network ftop knows nothing about.
+	Spread  bool
 	MinVRAM uint64 // MiB; 0 means no constraint
+	// Adopt takes the card named by GPUUUID although processes are running on it:
+	// they are the caller's own, started before it claimed.
+	Adopt bool
 	// Owner is the declared identity. It is a display string, not a credential:
 	// every agent runs as the same unix user, so this cannot be authenticated and
 	// must never be used to grant anything.
@@ -38,9 +54,9 @@ type ClaimRequest struct {
 	// which is the collision the whole tool exists to prevent. A card missing from this
 	// map is not known to be idle, so it is not offered.
 	Observed map[string]Observation
-	// RequireIdle makes Observed authoritative: every candidate must be present in it
-	// with an enumeration that found nothing. claim sets it whenever it has a fresh
-	// observation.
+	// RequireIdle makes Observed authoritative: every card handed out, a named one
+	// included, must be present in it with an enumeration that found nothing. claim
+	// sets it whenever it has a fresh observation.
 	RequireIdle bool
 }
 
@@ -116,85 +132,75 @@ func ownerKey(s string) string { return sanitizeText(s, 120) }
 // with a space fails to find the claim you just made.
 func CanonicalOwner(s string) string { return ownerKey(s) }
 
-// Claim takes a card and records why.
-//
-// The selection is deliberately simple: an explicit UUID, or the first free card on
-// the named host that has enough memory. No scoring, no backfilling, no fairness.
-// The user assigns work to agents by hand and wants conflicts to reach them, not to
-// be resolved by a heuristic in a laptop process.
+// Claim takes one card and records why. It is Allocate for a request that wants
+// a single card and only needs that card back.
 func (s *Store) Claim(req ClaimRequest) (ClaimResult, error) {
-	res, err := s.ClaimMany([]ClaimRequest{req})
+	a, err := s.Allocate(req)
 	if err != nil {
-		var be *BatchError
-		if errors.As(err, &be) {
-			return ClaimResult{}, be.Err
-		}
 		return ClaimResult{}, err
 	}
-	return res[0], nil
+	return a.Claims[0], nil
 }
 
-// BatchError is a ClaimMany failure: which request failed, after how many had been
-// chosen. Nothing was recorded — the batch is one transaction — so Done says how
-// far the selection got, which is what tells "only 3 of the 8 cards asked for are
-// free" from "the third card named is held".
-type BatchError struct {
-	Index int // the request that failed, 0-based
-	Want  int // how many were asked for
-	Err   error
+// Allocation is what one claim request took.
+type Allocation struct {
+	// Group names every card taken; release and renew accept it.
+	Group     string        `json:"group"`
+	Claims    []ClaimResult `json:"claims"`
+	Placement Placement     `json:"placement"`
 }
 
-func (e *BatchError) Error() string {
-	if e.Want == 1 {
-		return e.Err.Error()
-	}
-	return fmt.Sprintf("card %d of %d: %v (nothing was claimed)", e.Index+1, e.Want, e.Err)
-}
-func (e *BatchError) Unwrap() error { return e.Err }
-
-// ClaimMany takes several cards in one transaction: all of them, or none.
+// Allocate takes the cards a request asks for in one transaction: all of them, or
+// none.
 //
-// It exists for speed and for honesty. An agent asked to "use every free GPU" used to
-// loop over `ftop claim`, one process, one observation and one transaction per card;
-// on a 40-card fleet that is most of a minute, and a loop that fails half way leaves
-// half a fleet claimed for a job that will not run. Here every request is chosen
-// against the same transaction, so the second request for "any card on h1" sees the
-// first one's claim and takes the next card, and a failure anywhere rolls all of them
-// back.
-func (s *Store) ClaimMany(reqs []ClaimRequest) ([]ClaimResult, error) {
-	if len(reqs) == 0 {
-		return nil, fmt.Errorf("%w: nothing to claim", ErrInvalid)
-	}
-	batch := func(i int, err error) error { return &BatchError{Index: i, Want: len(reqs), Err: err} }
-	for i := range reqs {
-		if err := normalizeClaim(&reqs[i]); err != nil {
-			return nil, batch(i, err)
-		}
+// One transaction is the point. An agent that needed four cards used to loop over
+// `ftop claim`, and a loop that failed half way left half a job's cards claimed for a
+// job that would not run; two agents looping on one host took turns and neither got
+// a full set. Every transaction takes the write lock up front (see Open), so the
+// choice and the records cannot interleave with another claim.
+func (s *Store) Allocate(req ClaimRequest) (Allocation, error) {
+	if err := normalizeClaim(&req); err != nil {
+		return Allocation{}, err
 	}
 	now := time.Now()
 	tx, err := s.db.Begin()
 	if err != nil {
-		return nil, fmt.Errorf("ledger: %w", err)
+		return Allocation{}, fmt.Errorf("ledger: %w", err)
 	}
 	defer tx.Rollback()
-	out := make([]ClaimResult, 0, len(reqs))
-	for i, req := range reqs {
-		r, err := claimIn(tx, req, now)
+	cards, plc, err := chooseCards(tx, req)
+	if err != nil {
+		return Allocation{}, err
+	}
+	out := Allocation{Group: newGroupID(now), Placement: plc}
+	for _, card := range cards {
+		r, err := recordClaim(tx, req, card, out.Group, now)
 		if err != nil {
-			return nil, batch(i, err)
+			return Allocation{}, err
 		}
-		out = append(out, r)
+		out.Claims = append(out.Claims, r)
 	}
 	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("ledger: %w", err)
+		return Allocation{}, fmt.Errorf("ledger: %w", err)
 	}
 	return out, nil
 }
 
 // normalizeClaim validates a request and sanitises its free text in place.
 func normalizeClaim(req *ClaimRequest) error {
-	if req.Host == "" && req.GPUUUID == "" {
-		return fmt.Errorf("%w: host or gpu_uuid is required", ErrInvalid)
+	if req.Count == 0 {
+		req.Count = 1
+	}
+	switch {
+	case req.Count < 0:
+		return fmt.Errorf("%w: the card count must be positive", ErrInvalid)
+	case req.GPUUUID != "" && req.Count > 1:
+		return fmt.Errorf("%w: a named card is one card; name a host to take several", ErrInvalid)
+	case req.Spread && (req.Host != "" || req.GPUUUID != ""):
+		return fmt.Errorf("%w: spread is for automatic placement; it cannot be combined "+
+			"with a named host or card", ErrInvalid)
+	case req.Adopt && req.GPUUUID == "":
+		return fmt.Errorf("%w: adopt takes a card by name; give its uuid", ErrInvalid)
 	}
 	note := sanitizeText(req.Note, 1000)
 	directive := sanitizeText(req.Directive, 300)
@@ -215,31 +221,23 @@ func normalizeClaim(req *ClaimRequest) error {
 	return nil
 }
 
-// claimIn chooses a card for one normalised request and records the claim inside tx.
-func claimIn(tx *sql.Tx, req ClaimRequest, now time.Time) (ClaimResult, error) {
-	nowNSV := now.UnixNano()
-	id := newID(now)
-
-	gpu, err := chooseCard(tx, req)
-	if err != nil {
-		return ClaimResult{}, err
-	}
-
+// recordClaim writes the claim on one chosen card inside tx.
+func recordClaim(tx *sql.Tx, req ClaimRequest, gpu Card, group string, now time.Time) (ClaimResult, error) {
 	c := Claim{
-		ID: id, Host: gpu.Host, GPUUUID: gpu.GPUUUID,
+		ID: newID(now), Host: gpu.Host, GPUUUID: gpu.GPUUUID,
 		Owner: req.Owner, Session: req.Session, Repo: req.Repo,
 		Branch: req.Branch, Cwd: req.Cwd, Why: req.Why, Note: req.Note,
-		Directive: req.Directive,
-		Created:   now, Updated: now,
+		Directive: req.Directive, Group: group,
+		Created: now, Updated: now,
 		Expires: now.Add(req.For),
 	}
-	_, err = tx.Exec(`INSERT INTO claims
+	_, err := tx.Exec(`INSERT INTO claims
 		(id, host, gpu_uuid, owner, session, repo, branch, cwd, why, note, directive,
-		 created_ns, updated_ns, expires_ns, closed, close_cause, closed_ns)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,'',0)`,
+		 created_ns, updated_ns, expires_ns, closed, close_cause, closed_ns, grp)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,'',0,?)`,
 		c.ID, c.Host, c.GPUUUID, c.Owner, c.Session, c.Repo, c.Branch, c.Cwd,
 		c.Why, c.Note, c.Directive,
-		c.Created.UnixNano(), c.Updated.UnixNano(), c.Expires.UnixNano())
+		c.Created.UnixNano(), c.Updated.UnixNano(), c.Expires.UnixNano(), c.Group)
 	if err != nil {
 		// The partial unique index is the authority on "one open claim per card".
 		// Losing that race is an ordinary conflict, not a database failure.
@@ -248,164 +246,171 @@ func claimIn(tx *sql.Tx, req ClaimRequest, now time.Time) (ClaimResult, error) {
 		}
 		return ClaimResult{}, fmt.Errorf("ledger: %w", err)
 	}
-	if err := appendEvent(tx, nowNSV, "claim", c.ID, c.Host, c.GPUUUID, c.Owner, c.Why); err != nil {
+	if err := appendEvent(tx, now.UnixNano(), "claim", c.ID, c.Host, c.GPUUUID, c.Owner, c.Why); err != nil {
 		return ClaimResult{}, err
 	}
 	gpu.Claim = &c
 	return ClaimResult{Claim: c, Card: gpu}, nil
 }
 
-// chooseCard resolves the request to one free card.
-func chooseCard(tx *sql.Tx, req ClaimRequest) (Card, error) {
-	const cols = `c.gpu_uuid, c.host, c.idx, c.name, c.mem_total, c.first_seen, c.last_seen, c.present`
-
-	scan := func(row *sql.Row) (Card, error) {
-		var c Card
-		var fs, ls int64
-		err := row.Scan(&c.GPUUUID, &c.Host, &c.Index, &c.Name, &c.MemTotal, &fs, &ls, &c.Present)
-		c.FirstSeen, c.LastSeen = fromNS(fs), fromNS(ls)
-		return c, err
-	}
-
-	// An explicit UUID wins, but only if it is free; a held card is a conflict the
-	// agent must surface to the operator, not something to route around.
+// chooseCards resolves a request to the cards it gets: the named card, cards on the
+// named host, or a placement.
+func chooseCards(tx *sql.Tx, req ClaimRequest) ([]Card, Placement, error) {
 	if req.GPUUUID != "" {
-		var held string
-		err := tx.QueryRow(
-			`SELECT id FROM claims WHERE gpu_uuid = ? AND closed = 0`, req.GPUUUID).Scan(&held)
-		if err == nil {
-			return Card{}, conflictErr(tx, req.GPUUUID)
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return Card{}, fmt.Errorf("ledger: %w", err)
-		}
-		row := tx.QueryRow(`SELECT `+cols+` FROM cards c WHERE c.gpu_uuid = ?`, req.GPUUUID)
-		c, err := scan(row)
-		if errors.Is(err, sql.ErrNoRows) {
-			return Card{}, fmt.Errorf("%w: %s", ErrNoSuchCard, req.GPUUUID)
-		}
+		c, err := chooseNamedCard(tx, req)
 		if err != nil {
-			return Card{}, fmt.Errorf("ledger: %w", err)
+			return nil, Placement{}, err
 		}
-		// An explicit UUID selects a card; it does not overrule the other
-		// constraints. `-host h1 -gpu GPU-3` where GPU-3 lives on h2 used to take the
-		// card on h2 and report success, so an agent that named a host it was told to
-		// use got a card somewhere else and had no reason to look.
-		if req.Host != "" && !strings.EqualFold(c.Host, req.Host) {
-			return Card{}, fmt.Errorf("%w: %s is on %s, not %s",
-				ErrNoSuchCard, req.GPUUUID, c.Host, req.Host)
-		}
-		if !c.Present {
-			return Card{}, fmt.Errorf("%w: %s is no longer reported by %s", ErrNoSuchCard,
-				c.GPUUUID, c.Host)
-		}
-		if req.MinVRAM > 0 && c.MemTotal < req.MinVRAM {
-			return Card{}, fmt.Errorf("%w: %s has %d MiB, less than the %d MiB asked for",
-				ErrNoSuchCard, req.GPUUUID, c.MemTotal, req.MinVRAM)
-		}
-		return c, nil
+		return []Card{c}, Placement{Mode: "gpu",
+			Reason: fmt.Sprintf("%s on %s was named", c.GPUUUID, c.Host)}, nil
 	}
-
-	// Otherwise any free card on the host that the probe saw idle. Lowest index first so
-	// a repeated claim lands on the same card and the operator's mental map stays
-	// stable.
-	q := `SELECT ` + cols + ` FROM cards c
-		WHERE c.host = ? AND c.present = 1
-		  AND NOT EXISTS (SELECT 1 FROM claims k WHERE k.gpu_uuid = c.gpu_uuid AND k.closed = 0)`
-	args := []any{req.Host}
-	if req.MinVRAM > 0 {
-		q += ` AND c.mem_total >= ?`
-		args = append(args, req.MinVRAM)
+	slots, err := loadSlots(tx, req)
+	if err != nil {
+		return nil, Placement{}, err
 	}
-	q += ` ORDER BY c.idx`
+	if req.Host != "" {
+		return chooseOnHost(tx, req, slots)
+	}
+	return place(slots, req.Count, req.Spread)
+}
 
-	rows, err := tx.Query(q, args...)
+// chooseNamedCard checks that the card a request names may be taken.
+func chooseNamedCard(tx *sql.Tx, req ClaimRequest) (Card, error) {
+	// A held card is a conflict the agent must surface to the operator, not something
+	// to route around.
+	var held string
+	err := tx.QueryRow(
+		`SELECT id FROM claims WHERE gpu_uuid = ? AND closed = 0`, req.GPUUUID).Scan(&held)
+	if err == nil {
+		return Card{}, conflictErr(tx, req.GPUUUID)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return Card{}, fmt.Errorf("ledger: %w", err)
+	}
+	var c Card
+	var fs, ls int64
+	err = tx.QueryRow(`SELECT gpu_uuid, host, idx, name, mem_total, first_seen, last_seen, present
+		FROM cards WHERE gpu_uuid = ?`, req.GPUUUID).
+		Scan(&c.GPUUUID, &c.Host, &c.Index, &c.Name, &c.MemTotal, &fs, &ls, &c.Present)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Card{}, fmt.Errorf("%w: %s", ErrNoSuchCard, req.GPUUUID)
+	}
 	if err != nil {
 		return Card{}, fmt.Errorf("ledger: %w", err)
 	}
-	var candidates []Card
-	for rows.Next() {
-		var c Card
-		var fs, ls int64
-		if err := rows.Scan(&c.GPUUUID, &c.Host, &c.Index, &c.Name, &c.MemTotal, &fs, &ls, &c.Present); err != nil {
-			rows.Close()
-			return Card{}, fmt.Errorf("ledger: %w", err)
-		}
-		c.FirstSeen, c.LastSeen = fromNS(fs), fromNS(ls)
-		candidates = append(candidates, c)
+	c.FirstSeen, c.LastSeen = fromNS(fs), fromNS(ls)
+	// An explicit UUID selects a card; it does not overrule the other
+	// constraints. `-host h1 -gpu GPU-3` where GPU-3 lives on h2 used to take the
+	// card on h2 and report success, so an agent that named a host it was told to
+	// use got a card somewhere else and had no reason to look.
+	if req.Host != "" && !strings.EqualFold(c.Host, req.Host) {
+		return Card{}, fmt.Errorf("%w: %s is on %s, not %s",
+			ErrNoSuchCard, req.GPUUUID, c.Host, req.Host)
 	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return Card{}, fmt.Errorf("ledger: %w", err)
+	if !c.Present {
+		return Card{}, fmt.Errorf("%w: %s is no longer reported by %s", ErrNoSuchCard,
+			c.GPUUUID, c.Host)
 	}
-	// The first candidate the probe found empty. A card it did not enumerate is
-	// skipped: "does not know" is not "idle", and picking it is how an agent ended up
-	// on a card with another job's processes on it.
-	var busy int
-	var busyUUID string
-	for _, c := range candidates {
-		if !idleForClaim(req, c) {
-			if ob, ok := req.Observed[c.GPUUUID]; ok && ob.ProcsKnown && ob.Procs > 0 {
-				busy++
-				busyUUID = c.GPUUUID
-			}
-			continue
+	if req.MinVRAM > 0 && c.MemTotal < req.MinVRAM {
+		return Card{}, fmt.Errorf("%w: %s has %d MiB, less than the %d MiB asked for",
+			ErrNoSuchCard, req.GPUUUID, c.MemTotal, req.MinVRAM)
+	}
+	// Naming a card does not make it idle. A named card used to skip the check, so an
+	// agent could take a card a job nobody claimed was running on; the probe's answer
+	// applies here like everywhere else. Adopt is the one way past it, for the caller
+	// whose own unclaimed job that is.
+	if req.RequireIdle && !req.Adopt {
+		if ob, seen := req.Observed[c.GPUUUID]; !seen || !ob.Idle() {
+			return Card{}, &NotIdleError{GPUUUID: c.GPUUUID, Host: c.Host, Observed: seen,
+				Procs: ob.Procs, ProcsKnown: ob.ProcsKnown, UnattributedMiB: ob.UnattributedMiB}
 		}
-		return c, nil
+	}
+	return c, nil
+}
+
+// chooseOnHost takes the lowest-index idle cards on the named host, so a repeated
+// claim lands on the same cards and the operator's mental map stays stable.
+func chooseOnHost(tx *sql.Tx, req ClaimRequest, slots []*slot) ([]Card, Placement, error) {
+	var sl *slot
+	for _, x := range slots {
+		if x.host == req.Host {
+			sl = x
+		}
+	}
+	if sl != nil && len(sl.idle) >= req.Count {
+		cards := sl.idle[:req.Count]
+		return cards, Placement{Mode: "host", Reason: fmt.Sprintf(
+			"%s was named; %d of its %d cards were idle", sl.host, len(sl.idle), sl.cards)}, nil
+	}
+	if sl != nil && len(sl.idle) > 0 {
+		return nil, Placement{}, &InsufficientError{Want: req.Count, Host: sl.host,
+			MostOnOneHost: len(sl.idle), BestHost: sl.host, Idle: len(sl.idle), Hosts: 1}
 	}
 	// Nothing selectable. Distinguish the reasons: the agent's next action differs for
 	// each, and a single "unavailable" tells it nothing.
-	var n int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM cards WHERE host = ? AND present = 1`,
-		req.Host).Scan(&n); err != nil {
-		return Card{}, fmt.Errorf("ledger: %w", err)
-	}
-	if n == 0 {
-		return Card{}, fmt.Errorf("%w: no cards known on %s (has ftop observed it?)",
+	if sl == nil || sl.cards == 0 {
+		return nil, Placement{}, fmt.Errorf("%w: no cards known on %s (has ftop observed it?)",
 			ErrNoSuchCard, req.Host)
 	}
-	var held int
-	if err := tx.QueryRow(
-		`SELECT COUNT(*) FROM claims k JOIN cards c ON c.gpu_uuid = k.gpu_uuid
-		 WHERE c.host = ? AND k.closed = 0`, req.Host).Scan(&held); err != nil {
-		return Card{}, fmt.Errorf("ledger: %w", err)
-	}
-	if held >= n {
+	if sl.held >= sl.cards {
 		holders, err := holdersOnHost(tx, req.Host)
 		if err != nil {
-			return Card{}, err
+			return nil, Placement{}, err
 		}
-		return Card{}, &NoFreeCardError{Host: req.Host, Cards: n, Held: held, Holders: holders}
+		return nil, Placement{}, &NoFreeCardError{Host: req.Host, Cards: sl.cards, Held: sl.held,
+			Holders: holders}
 	}
-	if req.RequireIdle {
-		if busy > 0 {
-			return Card{}, fmt.Errorf("%w: every unclaimed card on %s has processes on it "+
-				"(%s); someone is running work nobody claimed. Take an idle card from "+
-				"`ftop gpu list -safe`, or ask the operator",
-				ErrNoSuchCard, req.Host, busyUUID)
-		}
-		return Card{}, fmt.Errorf("%w: no card on %s has been observed idle; run "+
+	if req.RequireIdle && sl.busy > 0 {
+		return nil, Placement{}, fmt.Errorf("%w: every unclaimed card on %s has processes on it "+
+			"(%s); someone is running work nobody claimed. Take an idle card from "+
+			"`ftop gpu list -safe`, or ask the operator",
+			ErrNoSuchCard, req.Host, sl.busyUUID)
+	}
+	if req.RequireIdle && sl.small == 0 {
+		return nil, Placement{}, fmt.Errorf("%w: no card on %s has been observed idle; run "+
 			"`ftop gpu list -safe` to see which are", ErrNoSuchCard, req.Host)
 	}
-	return Card{}, fmt.Errorf("%w: no free card on %s with at least %d MiB",
+	return nil, Placement{}, fmt.Errorf("%w: no free card on %s with at least %d MiB",
 		ErrNoSuchCard, req.Host, req.MinVRAM)
 }
 
-// idleForClaim reports whether a card may be handed out automatically.
-//
-// When the caller has an observation, only a card it enumerated and found empty
-// qualifies. A claim that names an exact UUID is exempt: there the agent has chosen,
-// and refusing would only make it claim the same card under another name.
+// idleForClaim reports whether a card may be handed out: with an observation, only
+// a card it enumerated and found empty qualifies.
 func idleForClaim(req ClaimRequest, c Card) bool {
 	if !req.RequireIdle {
 		return true
 	}
 	ob, ok := req.Observed[c.GPUUUID]
-	if !ok || !ob.ProcsKnown {
-		return false
-	}
-	return ob.Procs == 0 && ob.UnattributedMiB <= UnattributedThreshold(ob.MemTotalMiB)
+	return ok && ob.Idle()
 }
+
+// NotIdleError refuses a named card the observation does not show idle.
+type NotIdleError struct {
+	GPUUUID string `json:"gpu_uuid"`
+	Host    string `json:"host"`
+	// Observed is false when the pass before the claim did not see the card at all.
+	Observed        bool  `json:"observed"`
+	Procs           int   `json:"procs"`
+	ProcsKnown      bool  `json:"procs_known"`
+	UnattributedMiB int64 `json:"unattributed_mib,omitempty"`
+}
+
+func (e *NotIdleError) Error() string {
+	switch {
+	case !e.Observed:
+		return fmt.Sprintf("%s on %s was not observed, so ftop cannot confirm it is idle",
+			e.GPUUUID, e.Host)
+	case !e.ProcsKnown:
+		return fmt.Sprintf("%s on %s: its process list could not be read, so ftop cannot "+
+			"confirm it is idle", e.GPUUUID, e.Host)
+	case e.Procs > 0:
+		return fmt.Sprintf("%s on %s has %d process(es) running that nobody claimed",
+			e.GPUUUID, e.Host, e.Procs)
+	}
+	return fmt.Sprintf("%s on %s has %d MiB in use with no process on that host",
+		e.GPUUUID, e.Host, e.UnattributedMiB)
+}
+func (e *NotIdleError) Unwrap() error { return ErrNotIdle }
 
 // conflictErr builds the error an agent needs to decide whether to escalate.
 //
@@ -578,21 +583,150 @@ func (s *Store) ReleaseAs(id, owner string, cause string, actor string) (Claim, 
 	if owner != "" && c.Owner != ownerKey(owner) {
 		return Claim{}, fmt.Errorf("%w: held by %s", ErrNotOwner, c.Owner)
 	}
-	if cause == "" {
-		cause = "released"
-	}
-	if _, err := tx.Exec(`UPDATE claims SET closed = 1, closed_ns = ?, close_cause = ?, updated_ns = ?
-		WHERE id = ?`, now, cause, now, id); err != nil {
-		return Claim{}, fmt.Errorf("ledger: %w", err)
-	}
-	if err := appendEvent(tx, now, cause, id, c.Host, c.GPUUUID, actor, ""); err != nil {
+	if err := closeIn(tx, &c, cause, actor, now); err != nil {
 		return Claim{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return Claim{}, fmt.Errorf("ledger: %w", err)
 	}
-	c.Closed, c.CloseCause, c.ClosedAt, c.Updated = true, cause, fromNS(now), fromNS(now)
 	return c, nil
+}
+
+// closeIn closes one open claim inside tx and records who did it.
+func closeIn(tx *sql.Tx, c *Claim, cause, actor string, now int64) error {
+	if cause == "" {
+		cause = "released"
+	}
+	if _, err := tx.Exec(`UPDATE claims SET closed = 1, closed_ns = ?, close_cause = ?, updated_ns = ?
+		WHERE id = ?`, now, cause, now, c.ID); err != nil {
+		return fmt.Errorf("ledger: %w", err)
+	}
+	if err := appendEvent(tx, now, cause, c.ID, c.Host, c.GPUUUID, actor, ""); err != nil {
+		return err
+	}
+	c.Closed, c.CloseCause, c.ClosedAt, c.Updated = true, cause, fromNS(now), fromNS(now)
+	return nil
+}
+
+// Group returns every claim in a group, open or closed, in host and card order.
+func (s *Store) Group(group string) ([]Claim, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("ledger: %w", err)
+	}
+	defer tx.Rollback()
+	return groupIn(tx, group, false)
+}
+
+// groupIn loads a group's claims, only the open ones when openOnly is set. A group
+// with no claims at all is ErrNotFound; one whose claims are all closed, asked for
+// its open ones, is ErrAlreadyClosed.
+func groupIn(tx *sql.Tx, group string, openOnly bool) ([]Claim, error) {
+	rows, err := tx.Query(`SELECT k.id, k.closed FROM claims k
+		LEFT JOIN cards c ON c.gpu_uuid = k.gpu_uuid
+		WHERE k.grp = ? ORDER BY k.host, c.idx, k.id`, group)
+	if err != nil {
+		return nil, fmt.Errorf("ledger: %w", err)
+	}
+	var ids []string
+	found := false
+	for rows.Next() {
+		var id string
+		var closed bool
+		if err := rows.Scan(&id, &closed); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("ledger: %w", err)
+		}
+		found = true
+		if !openOnly || !closed {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("ledger: %w", err)
+	}
+	if !found {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, group)
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("%w: every claim in %s", ErrAlreadyClosed, group)
+	}
+	out := make([]Claim, 0, len(ids))
+	for _, id := range ids {
+		c, err := loadClaim(tx, id)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// ReleaseGroup closes every open claim in a group, or none of them.
+//
+// The owner rule is ReleaseAs's, applied to each claim before any is closed: a group
+// is one command's cards, so its claims share an owner, and a group that somehow
+// mixed owners is refused whole rather than released in part.
+func (s *Store) ReleaseGroup(group, owner, cause, actor string) ([]Claim, error) {
+	now := nowNS()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("ledger: %w", err)
+	}
+	defer tx.Rollback()
+	claims, err := groupIn(tx, group, true)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range claims {
+		if owner != "" && c.Owner != ownerKey(owner) {
+			return nil, fmt.Errorf("%w: %s is held by %s", ErrNotOwner, c.ID, c.Owner)
+		}
+	}
+	for i := range claims {
+		if err := closeIn(tx, &claims[i], cause, actor, now); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("ledger: %w", err)
+	}
+	return claims, nil
+}
+
+// RenewGroup extends every open claim in a group to the same new deadline. A job's
+// cards end together, and renewing them one by one is how one card was forgotten and
+// expired under a running job.
+func (s *Store) RenewGroup(group, owner string, forDur time.Duration) ([]Claim, error) {
+	if err := validateDuration("--for", forDur); err != nil {
+		return nil, err
+	}
+	now := nowNS()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("ledger: %w", err)
+	}
+	defer tx.Rollback()
+	claims, err := groupIn(tx, group, true)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range claims {
+		if owner != "" && c.Owner != ownerKey(owner) {
+			return nil, fmt.Errorf("%w: %s is held by %s", ErrNotOwner, c.ID, c.Owner)
+		}
+	}
+	exp := time.Unix(0, now).Add(forDur)
+	for i := range claims {
+		if err := renewIn(tx, &claims[i], owner, exp, now); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("ledger: %w", err)
+	}
+	return claims, nil
 }
 
 // Renew extends a live claim.
@@ -621,19 +755,26 @@ func (s *Store) Renew(id, owner string, forDur time.Duration) (Claim, error) {
 	if owner != "" && c.Owner != ownerKey(owner) {
 		return Claim{}, fmt.Errorf("%w: held by %s", ErrNotOwner, c.Owner)
 	}
-	exp := time.Unix(0, now).Add(forDur)
-	if _, err := tx.Exec(`UPDATE claims SET expires_ns = ?, updated_ns = ? WHERE id = ?`,
-		exp.UnixNano(), now, id); err != nil {
-		return Claim{}, fmt.Errorf("ledger: %w", err)
-	}
-	if err := appendEvent(tx, now, "renew", id, c.Host, c.GPUUUID, owner, ""); err != nil {
+	if err := renewIn(tx, &c, owner, time.Unix(0, now).Add(forDur), now); err != nil {
 		return Claim{}, err
 	}
 	if err := tx.Commit(); err != nil {
 		return Claim{}, fmt.Errorf("ledger: %w", err)
 	}
-	c.Expires, c.Updated = exp, fromNS(now)
 	return c, nil
+}
+
+// renewIn moves one open claim's deadline inside tx.
+func renewIn(tx *sql.Tx, c *Claim, actor string, exp time.Time, now int64) error {
+	if _, err := tx.Exec(`UPDATE claims SET expires_ns = ?, updated_ns = ? WHERE id = ?`,
+		exp.UnixNano(), now, c.ID); err != nil {
+		return fmt.Errorf("ledger: %w", err)
+	}
+	if err := appendEvent(tx, now, "renew", c.ID, c.Host, c.GPUUUID, actor, ""); err != nil {
+		return err
+	}
+	c.Expires, c.Updated = exp, fromNS(now)
+	return nil
 }
 
 func loadClaim(tx *sql.Tx, id string) (Claim, error) {
@@ -641,11 +782,11 @@ func loadClaim(tx *sql.Tx, id string) (Claim, error) {
 	var created, updated, expires, closedNS int64
 	var closed int
 	err := tx.QueryRow(`SELECT id, host, gpu_uuid, owner, session, repo, branch, cwd, why, note,
-		directive, created_ns, updated_ns, expires_ns, closed, close_cause, closed_ns
+		directive, created_ns, updated_ns, expires_ns, closed, close_cause, closed_ns, grp
 		FROM claims WHERE id = ?`, id).
 		Scan(&c.ID, &c.Host, &c.GPUUUID, &c.Owner, &c.Session, &c.Repo, &c.Branch, &c.Cwd,
 			&c.Why, &c.Note, &c.Directive, &created, &updated, &expires, &closed,
-			&c.CloseCause, &closedNS)
+			&c.CloseCause, &closedNS, &c.Group)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Claim{}, fmt.Errorf("%w: %s", ErrNotFound, id)
 	}
@@ -689,9 +830,9 @@ func appendEvent(tx *sql.Tx, at int64, kind, claimID, host, uuid, actor, detail 
 // This is the whole of ftop's automatic cleanup, and its shape is the point. The
 // deadline alone never releases a card: a job that overran its estimate is still a
 // job, and handing its card to the next agent is the one failure the user said must
-// go to them. Only an observation that says "this card has no processes at all"
-// closes the claim — and `known == false` (the probe could not enumerate) is not
-// that observation.
+// go to them. Only an observation that says "this card is idle" closes the claim —
+// `known == false` (the probe could not enumerate) is not that observation, and
+// neither is a card with no processes but memory in use that none accounts for.
 func (s *Store) Sweep(observed map[string]Observation) (released []Claim, kept []Claim, err error) {
 	now := nowNS()
 	tx, err := s.db.Begin()
@@ -724,8 +865,7 @@ func (s *Store) Sweep(observed map[string]Observation) (released []Claim, kept [
 			return nil, nil, err
 		}
 		ob, seen := observed[c.GPUUUID]
-		idle := seen && ob.ProcsKnown && ob.Procs == 0
-		if !idle {
+		if !seen || !ob.Idle() {
 			kept = append(kept, c)
 			continue
 		}

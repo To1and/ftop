@@ -27,6 +27,12 @@ columns  = 0          # max lanes of cards; 0 = fit the terminal
 # Shorten a card title without touching ~/.ssh/config.
 # "lab-node-1" = "node-1"
 
+[claim]
+# Hosts a claim that names no host never lands on: a workstation, or a machine
+# without the shared filesystem the rest of the fleet has. They stay monitored and
+# can still be claimed by name (ftop claim -host). Patterns match like drop's.
+# manual = ["my-workstation"]
+
 # Hosts that are not in the ssh config.
 # [[host]]
 # name     = "lab-gpu"       # the ssh destination

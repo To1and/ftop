@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -89,7 +90,7 @@ func seedStore(t *testing.T) string {
 func TestClaimThenConflictThenRelease(t *testing.T) {
 	store := seedStore(t)
 
-	env, code := run(t, store, "claim", "-host", "h1", "-why", "train", "-for", "1h", "-as", "agent-a")
+	env, code := run(t, store, "claim", "-host", "h1", "-why", "train", "-for", "1h", "-as", "agent-a", "-no-ssh")
 	if code != ExitOK {
 		t.Fatalf("claim: code=%d err=%+v", code, env.Error)
 	}
@@ -99,7 +100,7 @@ func TestClaimThenConflictThenRelease(t *testing.T) {
 		t.Errorf("claimed %q, want the first free card", data.Claim.GPUUUID)
 	}
 
-	env, code = run(t, store, "claim", "-host", "h1", "-gpu", "GPU-0", "-why", "x", "-for", "1h", "-as", "agent-b")
+	env, code = run(t, store, "claim", "-host", "h1", "-gpu", "GPU-0", "-why", "x", "-for", "1h", "-as", "agent-b", "-no-ssh")
 	if code != ExitHeld {
 		t.Fatalf("second claim: code=%d, want ExitHeld", code)
 	}
@@ -115,7 +116,7 @@ func TestClaimThenConflictThenRelease(t *testing.T) {
 	if _, code := run(t, store, "release", data.Claim.ID, "-as", "agent-a"); code != ExitOK {
 		t.Errorf("release: code=%d", code)
 	}
-	if _, code := run(t, store, "claim", "-host", "h1", "-why", "now free", "-for", "1h", "-as", "agent-b"); code != ExitOK {
+	if _, code := run(t, store, "claim", "-host", "h1", "-why", "now free", "-for", "1h", "-as", "agent-b", "-no-ssh"); code != ExitOK {
 		t.Errorf("card stayed held: code=%d", code)
 	}
 }
@@ -127,7 +128,7 @@ func TestClaimThenConflictThenRelease(t *testing.T) {
 // trying to be explicit, is the opposite of what it asked for.
 func TestFlagsAfterThePositionalAreHonoured(t *testing.T) {
 	store := seedStore(t)
-	env, _ := run(t, store, "claim", "-host", "h1", "-why", "held by a", "-for", "1h", "-as", "agent-a")
+	env, _ := run(t, store, "claim", "-host", "h1", "-why", "held by a", "-for", "1h", "-as", "agent-a", "-no-ssh")
 	var data claimData
 	remarshal(t, env.Data, &data)
 
@@ -155,8 +156,14 @@ func TestErrorsAreJSONWithStableCodes(t *testing.T) {
 		want int
 	}{
 		{[]string{"claim", "-host", "h1", "-for", "1h", "-as", "a"}, CodeUsage, ExitUsage},
-		{[]string{"claim", "-why", "x", "-for", "1h", "-as", "a"}, CodeUsage, ExitUsage},
 		{[]string{"claim", "-host", "h1", "-why", "x", "-as", "a"}, CodeUsage, ExitUsage},
+		{[]string{"claim", "-n", "0", "-why", "x", "-for", "1h", "-as", "a"}, CodeUsage, ExitUsage},
+		{[]string{"claim", "-gpu", "GPU-0", "-n", "2", "-why", "x", "-for", "1h", "-as", "a"}, CodeUsage, ExitUsage},
+		{[]string{"claim", "-host", "h1", "-spread", "-why", "x", "-for", "1h", "-as", "a"}, CodeUsage, ExitUsage},
+		{[]string{"claim", "-adopt", "-why", "x", "-for", "1h", "-as", "a"}, CodeUsage, ExitUsage},
+		// With no host named ftop places the claim, and it will not place one it has
+		// not observed: this test fleet has no host to observe.
+		{[]string{"claim", "-why", "x", "-for", "1h", "-as", "a"}, CodeNoObservation, ExitUnavail},
 		{[]string{"release", "L-nope", "-as", "a"}, CodeNotFound, ExitState},
 		// -no-ssh pins the answer to the ledger: without it, claim would first try to
 		// observe the host and fail with a reachability error instead.
@@ -223,7 +230,7 @@ func TestJSONOnlyOnStdout(t *testing.T) {
 	t.Setenv("FTOP_LEDGER", seedStore(t))
 	var buf bytes.Buffer
 	io_ := IO{Out: &buf, Err: &buf}
-	dispatch(io_, []string{"claim", "-host", "h1", "-why", "x", "-for", "1h", "-as", "a"})
+	dispatch(io_, []string{"claim", "-host", "h1", "-why", "x", "-for", "1h", "-as", "a", "-no-ssh"})
 	body := strings.TrimSpace(buf.String())
 	if !strings.HasPrefix(body, "{") {
 		t.Fatalf("output does not start with JSON: %q", body)
@@ -939,7 +946,7 @@ func TestHostListsMachinesNotJustLedgerRows(t *testing.T) {
 // running on, so the count an agent must read before claiming is `safe`.
 func TestSummarySafeCountMatchesTheSafeFilter(t *testing.T) {
 	if !safeToTake(ledger.CardView{Card: ledger.Card{Present: true},
-		Observation: &ledger.Observation{ProcsKnown: true}}) {
+		Observation: &ledger.Observation{ProcsKnown: true, MemKnown: true}}) {
 		t.Error("an observed, empty, unclaimed card was not safe")
 	}
 	cases := []struct {
@@ -947,12 +954,12 @@ func TestSummarySafeCountMatchesTheSafeFilter(t *testing.T) {
 		v    ledger.CardView
 	}{
 		{"busy", ledger.CardView{Card: ledger.Card{Present: true},
-			Observation: &ledger.Observation{Procs: 1, ProcsKnown: true}}},
+			Observation: &ledger.Observation{Procs: 1, ProcsKnown: true, MemKnown: true}}},
 		{"not enumerated", ledger.CardView{Card: ledger.Card{Present: true},
 			Observation: &ledger.Observation{ProcsKnown: false}}},
 		{"never observed", ledger.CardView{Card: ledger.Card{Present: true}}},
 		{"left the fleet", ledger.CardView{Card: ledger.Card{Present: false},
-			Observation: &ledger.Observation{ProcsKnown: true}}},
+			Observation: &ledger.Observation{ProcsKnown: true, MemKnown: true}}},
 	}
 	for _, c := range cases {
 		if safeToTake(c.v) {
@@ -1053,5 +1060,170 @@ func TestRenewAfterARestart(t *testing.T) {
 	}
 	if _, code := run(t, store, "renew", data.Claims[0].ID, "-for", "2h"); code != ExitOK {
 		t.Fatalf("renew: code=%d", code)
+	}
+}
+
+// placementFleet is an isolated fleet of a four-card host, a two-card host and a
+// one-card workstation the operator marked manual, all in the ledger.
+func placementFleet(t *testing.T) (store, cfg string) {
+	t.Helper()
+	cfg = isolatedSSH(t, "Host lab-four\nHost lab-two\nHost lab-desk\n")
+	if err := os.WriteFile(cfg, append(mustRead(t, cfg),
+		[]byte("\n[claim]\nmanual = [\"lab-desk\"]\n")...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store = filepath.Join(t.TempDir(), "ledger.db")
+	s, err := ledger.Open(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var cards []ledger.Card
+	for host, n := range map[string]int{"lab-four": 4, "lab-two": 2, "lab-desk": 1} {
+		for i := 0; i < n; i++ {
+			cards = append(cards, ledger.Card{Host: host, GPUUUID: fmt.Sprintf("GPU-%s-%d", host, i),
+				Index: i, MemTotal: 24564})
+		}
+	}
+	if err := s.UpsertCards(cards); err != nil {
+		t.Fatal(err)
+	}
+	return store, cfg
+}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// TestClaimPlacesWithoutAHost: two cards with no host named go to the two-card
+// machine, come back with what to export, and leave with one release.
+func TestClaimPlacesWithoutAHost(t *testing.T) {
+	store, cfg := placementFleet(t)
+	env, code := run(t, store, "claim", "-n", "2", "-why", "ddp", "-for", "1h", "-as", "a",
+		"-no-ssh", "-config", cfg)
+	if code != ExitOK {
+		t.Fatalf("claim -n 2: code=%d err=%+v", code, env.Error)
+	}
+	var data claimData
+	remarshal(t, env.Data, &data)
+	if len(data.Hosts) != 1 || data.Hosts[0].Host != "lab-two" || len(data.Claims) != 2 {
+		t.Fatalf("placed %+v, want both cards on lab-two", data.Hosts)
+	}
+	want := "GPU-lab-two-0,GPU-lab-two-1"
+	if data.Hosts[0].CUDAVisibleDevices != want || data.Env["CUDA_VISIBLE_DEVICES"] != want {
+		t.Errorf("CUDA_VISIBLE_DEVICES = %q / %q, want %q", data.Hosts[0].CUDAVisibleDevices,
+			data.Env["CUDA_VISIBLE_DEVICES"], want)
+	}
+	if data.Env["FTOP_CLAIM"] != data.Group || data.Placement.Mode != "fit" {
+		t.Errorf("FTOP_CLAIM = %q, group %q, placement %+v", data.Env["FTOP_CLAIM"], data.Group,
+			data.Placement)
+	}
+	if !strings.Contains(data.Hint, "ftop release "+data.Group) {
+		t.Errorf("hint does not say how to release: %q", data.Hint)
+	}
+	env, code = run(t, store, "release", data.Group, "-as", "a")
+	if code != ExitOK {
+		t.Fatalf("release group: code=%d err=%+v", code, env.Error)
+	}
+	var rel releaseData
+	remarshal(t, env.Data, &rel)
+	if len(rel.Claims) != 2 || !rel.Claims[0].Closed || !rel.Claims[1].Closed {
+		t.Errorf("release closed %+v, want both", rel.Claims)
+	}
+}
+
+// TestManualHostIsNamedNotPlaced: the workstation fits one card best, but it is
+// manual, so a placement passes it by; naming it still works.
+func TestManualHostIsNamedNotPlaced(t *testing.T) {
+	store, cfg := placementFleet(t)
+	env, code := run(t, store, "claim", "-why", "x", "-for", "1h", "-as", "a", "-no-ssh", "-config", cfg)
+	if code != ExitOK {
+		t.Fatalf("claim: code=%d err=%+v", code, env.Error)
+	}
+	var data claimData
+	remarshal(t, env.Data, &data)
+	if data.Claim.Host == "lab-desk" {
+		t.Fatal("a placement chose the manual host")
+	}
+	if data.Claim.Host != "lab-two" {
+		t.Errorf("one card went to %s, want lab-two (the smallest that is not manual)", data.Claim.Host)
+	}
+	if _, code := run(t, store, "claim", "-host", "lab-desk", "-why", "x", "-for", "1h", "-as", "a",
+		"-no-ssh", "-config", cfg); code != ExitOK {
+		t.Errorf("claiming the manual host by name: code=%d", code)
+	}
+	env, _ = run(t, store, "host", "-config", cfg)
+	if !strings.Contains(fmt.Sprint(env.Data), "manual:true") {
+		t.Errorf("ftop host does not show the manual host: %v", env.Data)
+	}
+}
+
+// TestNoCapacityIsAStableCode: too few cards is its own code, says how many the
+// fleet could give, and claims nothing.
+func TestNoCapacityIsAStableCode(t *testing.T) {
+	store, cfg := placementFleet(t)
+	env, code := run(t, store, "claim", "-n", "5", "-why", "x", "-for", "1h", "-as", "a",
+		"-no-ssh", "-config", cfg)
+	if code != ExitHeld || env.Error == nil || env.Error.Code != CodeNoCapacity {
+		t.Fatalf("claim -n 5: code=%d err=%+v", code, env.Error)
+	}
+	var ie ledger.InsufficientError
+	remarshal(t, env.Error.Conflicts, &ie)
+	if ie.MostOnOneHost != 4 || ie.BestHost != "lab-four" || ie.Idle != 6 {
+		t.Errorf("conflicts = %+v, want 4 on lab-four and 6 idle", ie)
+	}
+	if !strings.Contains(env.Error.Hint, "-spread") {
+		t.Errorf("hint does not mention -spread although 6 cards are idle: %q", env.Error.Hint)
+	}
+	env, _ = run(t, store, "claim", "list")
+	if !strings.Contains(fmt.Sprint(env.Data), "count:0") {
+		t.Errorf("a failed claim left claims behind: %v", env.Data)
+	}
+}
+
+// TestGroupRenewsTogether: renew takes the group like release does.
+func TestGroupRenewsTogether(t *testing.T) {
+	store, cfg := placementFleet(t)
+	env, _ := run(t, store, "claim", "-n", "3", "-why", "x", "-for", "1h", "-as", "a",
+		"-no-ssh", "-config", cfg)
+	var data claimData
+	remarshal(t, env.Data, &data)
+	env, code := run(t, store, "renew", data.Group, "-for", "6h", "-as", "a")
+	if code != ExitOK {
+		t.Fatalf("renew group: code=%d err=%+v", code, env.Error)
+	}
+	var rel releaseData
+	remarshal(t, env.Data, &rel)
+	if len(rel.Claims) != 3 {
+		t.Fatalf("renewed %d claims, want 3", len(rel.Claims))
+	}
+	for _, c := range rel.Claims {
+		if time.Until(c.Expires) < 5*time.Hour {
+			t.Errorf("%s expires %v", c.ID, c.Expires)
+		}
+	}
+	if _, code := run(t, store, "release", data.Group, "-as", "b"); code != ExitState {
+		t.Errorf("another owner released the group: code=%d", code)
+	}
+}
+
+// TestClaimWithoutAnObservationRefuses: ftop hands out only cards it has just seen
+// idle. A claim that could not look used to fall back to the ledger whenever the host
+// was known — in practice, a build without a probe handed out cards silently. Only
+// -no-ssh says the ledger is enough.
+func TestClaimWithoutAnObservationRefuses(t *testing.T) {
+	store := seedStore(t)
+	env, code := run(t, store, "claim", "-host", "h1", "-why", "x", "-for", "1h", "-as", "a")
+	if code != ExitUnavail || env.Error == nil || env.Error.Code != CodeNoObservation {
+		t.Fatalf("claim with no observation: code=%d err=%+v, want no_observation", code, env.Error)
+	}
+	if _, code := run(t, store, "claim", "-host", "h1", "-why", "x", "-for", "1h", "-as", "a",
+		"-no-ssh"); code != ExitOK {
+		t.Errorf("-no-ssh claim: code=%d", code)
 	}
 }

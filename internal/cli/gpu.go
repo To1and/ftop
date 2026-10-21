@@ -252,11 +252,11 @@ func runGPUList(io_ IO, args []string) int {
 			// different sentence with a different next step.
 			ob := c.Observation
 			switch {
-			case ob == nil, !ob.ProcsKnown:
+			case ob == nil, !ob.ProcsKnown, !ob.MemKnown:
 				data.Summary.Unknown++
 			case c.Claim == nil && ob.Procs > 0:
 				data.Summary.Unclaimed++
-			case c.Claim == nil && ob.UnattributedMiB > ledger.UnattributedThreshold(ob.MemTotalMiB):
+			case c.Claim == nil && ob.Hidden():
 				data.Summary.Unclaimed++
 			}
 			if safeToTake(c) {
@@ -576,7 +576,7 @@ func observe(cfgPath, hostFilter string, cardsOnly bool, wait time.Duration, sto
 					o.MemTotalMiB = total
 				}
 				if g.MemUsed != nil {
-					o.MemUsedMiB = *g.MemUsed
+					o.MemUsedMiB, o.MemKnown = *g.MemUsed, true
 				}
 				o.MemReservedMiB = g.MemReserved
 				// Attributed memory is what this host's own process list says. The
@@ -639,12 +639,7 @@ func safeToTake(v ledger.CardView) bool {
 	if v.Claim != nil || !v.Present {
 		return false
 	}
-	ob := v.Observation
-	if ob == nil || !ob.ProcsKnown {
-		return false
-	}
-	return ob.Procs == 0 &&
-		ob.UnattributedMiB <= ledger.UnattributedThreshold(ob.MemTotalMiB)
+	return v.Observation != nil && v.Observation.Idle()
 }
 
 // uploadBudget is the time a first contact may spend uploading the probe, on top

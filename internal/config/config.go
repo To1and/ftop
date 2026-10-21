@@ -27,6 +27,10 @@ type Host struct {
 	// patterns match them too.
 	Aliases []string
 	Tags    []string
+	// Manual marks a host automatic placement never picks: it is monitored and may
+	// be claimed by name (`claim -host`), but a claim that names no host does not
+	// land on it. Set by the `manual` patterns in config.toml's [claim] section.
+	Manual bool
 
 	// override is a [[host]] block's hostname, which replaces ssh_config's.
 	override string
@@ -60,6 +64,11 @@ type Config struct {
 	// host", and the two must not collapse: treating an intentional empty
 	// selection as an absent one silently reconnects the whole fleet.
 	resolved bool
+
+	// manual is the [claim] manual patterns. They are matched once the fleet is final
+	// — merged, deduplicated and labelled — because a [[host]] block that overrides a
+	// discovered host replaces it, and a flag set on the discovered copy was lost.
+	manual []string
 
 	// err is a parse or schema failure recorded by applyTOML. Load returns it
 	// instead of proceeding: a config file ftop cannot read exactly is not a
@@ -177,6 +186,7 @@ func Load(path string) (*Config, error) {
 		if cfg.Hosts[i].Label == "" {
 			cfg.Hosts[i].Label = labelFor(cfg.Hosts[i].Name, prefix)
 		}
+		cfg.Hosts[i].Manual = matchAnyHost(cfg.Hosts[i], cfg.manual)
 	}
 	return cfg, nil
 }
@@ -328,7 +338,14 @@ type fileConfig struct {
 		ShowUnsupported bool `toml:"show_unsupported"`
 	} `toml:"general"`
 	Labels map[string]string `toml:"labels"`
-	Host   []struct {
+	// Claim holds what the agent-facing ledger needs from the user. Manual names
+	// the hosts placement must not choose by itself — a workstation, or a machine
+	// without the shared filesystem the rest of the fleet has. Patterns match like
+	// drop's.
+	Claim struct {
+		Manual []string `toml:"manual"`
+	} `toml:"claim"`
+	Host []struct {
 		Name     string `toml:"name"`
 		Label    string `toml:"label"`
 		Hostname string `toml:"hostname"`
@@ -363,6 +380,7 @@ func applyTOML(cfg *Config, discovered []Host, body string) {
 		cfg.Columns = fc.General.Columns
 	}
 	cfg.SSHConfig = expandHome(fc.General.SSHConfig)
+	cfg.manual = fc.Claim.Manual
 	cfg.ShowCPUOnly, cfg.ShowUnsupported = fc.General.ShowCPUOnly, fc.General.ShowUnsupported
 
 	extras := make([]Host, 0, len(fc.Host))

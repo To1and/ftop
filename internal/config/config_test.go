@@ -352,3 +352,31 @@ func TestBoardFiltersDefaultToHidden(t *testing.T) {
 		t.Error("demo settings ignore show_unsupported")
 	}
 }
+
+// TestManualHostsStayManaged: [claim] manual keeps a host out of automatic placement
+// and nothing else — it is still in the fleet, monitored like every other.
+func TestManualHostsStayManaged(t *testing.T) {
+	cfg := load(t, isolated(t, "Host lab-gpu-1\nHost lab-gpu-2\nHost lab-desk\n  HostName 192.0.2.9\n",
+		"[claim]\nmanual = [\"192.0.2.9\"]\n\n[[host]]\nname = \"lab-gpu-9\"\n"))
+	if got := names(cfg.Hosts); got != "lab-desk,lab-gpu-1,lab-gpu-2,lab-gpu-9" {
+		t.Fatalf("fleet = %q: a manual host must stay in it", got)
+	}
+	for _, h := range cfg.Hosts {
+		if h.Manual != (h.Name == "lab-desk") {
+			t.Errorf("%s: manual = %v", h.Name, h.Manual)
+		}
+	}
+}
+
+// TestManualSurvivesAHostOverride: a [[host]] block for a discovered host replaces
+// it, and the manual flag set on the discovered copy used to go with it, putting the
+// workstation back into automatic placement.
+func TestManualSurvivesAHostOverride(t *testing.T) {
+	cfg := load(t, isolated(t, "Host desk desk-alias\n  HostName 192.0.2.9\nHost lab-gpu-1\n",
+		"[claim]\nmanual = [\"desk-alias\"]\n\n[[host]]\nname = \"desk\"\nlabel = \"my desk\"\n"))
+	for _, h := range cfg.Hosts {
+		if h.Manual != (h.Name == "desk") {
+			t.Errorf("%s: manual = %v", h.Name, h.Manual)
+		}
+	}
+}

@@ -40,7 +40,7 @@ const APIVersion = 1
 const (
 	ExitOK      = 0
 	ExitUsage   = 2 // the command itself is wrong
-	ExitHeld    = 3 // someone else has the card; read holders and decide
+	ExitHeld    = 3 // the cards are not there to take: held, busy, or too few; read conflicts
 	ExitState   = 4 // the ledger says no: unknown card, wrong owner, already closed
 	ExitUnavail = 5 // the fleet could not be observed or the ledger could not be opened
 )
@@ -57,6 +57,8 @@ const (
 	CodeNotFound      ErrorCode = "lease_not_found"
 	CodeSchemaTooNew  ErrorCode = "schema_too_new"
 	CodeNoObservation ErrorCode = "no_observation"
+	CodeNoCapacity    ErrorCode = "no_capacity"
+	CodeNotIdle       ErrorCode = "not_idle"
 	CodeInternal      ErrorCode = "internal"
 )
 
@@ -136,6 +138,36 @@ func classify(err error) *ExitError {
 			Hint: "every card on this host is held; read `holders` for who and why, then " +
 				"wait, pick another host, or ask the operator.",
 			Conflicts: nf,
+		}}
+	}
+	var ie *ledger.InsufficientError
+	if errors.As(err, &ie) {
+		hint := "nothing was claimed. Ask for fewer cards, wait for some to be released, or " +
+			"ask the operator."
+		switch {
+		case ie.Host != "":
+			hint = fmt.Sprintf("nothing was claimed. Ask for at most %d here, or leave out -host "+
+				"and ftop will find a machine with enough.", ie.Idle)
+		case !ie.Spread && ie.Idle >= ie.Want:
+			hint = fmt.Sprintf("nothing was claimed. %d cards are idle, but no one machine has %d. "+
+				"If the job runs as separate one-card processes, add -spread; otherwise ask for "+
+				"at most %d, or wait.", ie.Idle, ie.Want, ie.MostOnOneHost)
+		}
+		return &ExitError{Status: ExitHeld, API: &APIError{
+			Code: CodeNoCapacity, Message: ie.Error(), Hint: hint, Conflicts: ie,
+		}}
+	}
+	var ne *ledger.NotIdleError
+	if errors.As(err, &ne) {
+		hint := "something nobody claimed is using that card; `ftop gpu show " + ne.GPUUUID +
+			"` lists it. Take another card or ask the operator. If those processes are " +
+			"yours, claim the card with -adopt."
+		if !ne.Observed || !ne.ProcsKnown {
+			hint = "ftop could not see what runs on that card. Retry, or take a card " +
+				"`ftop gpu list -safe` shows."
+		}
+		return &ExitError{Status: ExitHeld, API: &APIError{
+			Code: CodeNotIdle, Message: ne.Error(), Hint: hint, Conflicts: ne,
 		}}
 	}
 	switch {

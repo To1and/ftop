@@ -5,16 +5,29 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
+	"ftop/internal/config"
 	"ftop/internal/ledger"
 )
 
 // claimData is what `ftop claim` returns.
 type claimData struct {
+	// Group names every card this claim took; `release` and `renew` accept it.
+	Group  string         `json:"group"`
+	Claims []ledger.Claim `json:"claims"`
+	Cards  []ledger.Card  `json:"cards"`
+	// Claim and Card are the first of them. Until -n a claim was always one card,
+	// and callers written then read these two.
 	Claim ledger.Claim `json:"claim"`
 	Card  ledger.Card  `json:"card"`
+	// Hosts groups the cards by machine, each with the CUDA_VISIBLE_DEVICES value for
+	// a job there. One entry unless -spread put the cards on several machines.
+	Hosts []claimHost `json:"hosts"`
+	// Placement says why these cards: named, or chosen, and against what.
+	Placement ledger.Placement `json:"placement"`
 	// Env is the environment the agent should export for its own process. It is
 	// informational: ftop does not run the job, so nothing enforces it. Session id and
 	// card UUID are there so a later `ftop gpu show` can line an observation up with
@@ -24,13 +37,24 @@ type claimData struct {
 	Hint string `json:"hint"`
 }
 
+// claimHost is one machine's share of a claim.
+type claimHost struct {
+	Host               string   `json:"host"`
+	GPUUUIDs           []string `json:"gpu_uuids"`
+	ClaimIDs           []string `json:"claim_ids"`
+	CUDAVisibleDevices string   `json:"cuda_visible_devices"`
+}
+
 // runClaim implements `ftop claim`.
 func runClaim(io_ IO, args []string) int {
 	fs := flag.NewFlagSet("claim", flag.ContinueOnError)
 	fs.SetOutput(io_.Err)
 	var (
-		host    = fs.String("host", "", "host to take a card on")
-		uuid    = fs.String("gpu", "", "take this exact card instead of any free one")
+		host    = fs.String("host", "", "take the cards on this host (default: ftop chooses)")
+		uuid    = fs.String("gpu", "", "take this exact card")
+		count   = fs.Int("n", 1, "how many cards; all of them or none")
+		spread  = fs.Bool("spread", false, "the cards may be on different hosts: separate one-card jobs")
+		adopt   = fs.Bool("adopt", false, "with -gpu: take the card although processes run on it, because they are yours")
 		minVRAM = fs.Uint64("min-vram", 0, "minimum card memory in MiB")
 		// No default: a claim with a guessed duration is a claim whose deadline
 		// nobody chose. The flag is required and checked below.
@@ -41,15 +65,24 @@ func runClaim(io_ IO, args []string) int {
 		direct    = fs.String("directive", "", "the operator instruction behind this claim")
 		storeAt   = fs.String("store", "", "ledger path (default: ~/.local/state/ftop/ledger.db)")
 		noObserve = fs.Bool("no-ssh", false,
-			"never observe the fleet; claim only a card the ledger already knows")
+			"do not observe; choose from the ledger alone, without checking that cards are idle")
 		cfgPath = fs.String("config", "", "config.toml path")
 		wait    = fs.Duration("wait", 8*time.Second, "how long to collect an observation")
 	)
 	if err := parseFlags(fs, args); err != nil {
 		return emitErr(io_.Out, "claim", usageErr("%v", err))
 	}
-	if *host == "" && *uuid == "" {
-		return emitErr(io_.Out, "claim", usageErr("one of -host or -gpu is required"))
+	switch {
+	case *count < 1:
+		return emitErr(io_.Out, "claim", usageErr("-n must be at least 1"))
+	case *uuid != "" && *count > 1:
+		return emitErr(io_.Out, "claim", usageErr("-gpu names one card; for several on one "+
+			"machine use -host H -n N"))
+	case *spread && (*host != "" || *uuid != ""):
+		return emitErr(io_.Out, "claim", usageErr("-spread lets ftop place the cards; it "+
+			"cannot be combined with -host or -gpu"))
+	case *adopt && *uuid == "":
+		return emitErr(io_.Out, "claim", usageErr("-adopt takes one card by name; give it with -gpu"))
 	}
 	if *why == "" {
 		return emitErr(io_.Out, "claim", usageErr("-why is required: it is the only record of "+
@@ -85,69 +118,171 @@ func runClaim(io_ IO, args []string) int {
 	}
 	defer s.Close()
 
+	// With no host and no card named, ftop places the claim, on any host the user has
+	// not marked manual.
+	var placeOn []string
+	if *host == "" && *uuid == "" {
+		cfg, err := config.Load(expandHome(*cfgPath))
+		if err != nil {
+			return emitErr(io_.Out, "claim", usageErr("%v", err))
+		}
+		placeOn = []string{}
+		for _, h := range cfg.Hosts {
+			if !h.Manual {
+				placeOn = append(placeOn, h.Name)
+			}
+		}
+	}
+
 	// Observe before choosing, always.
 	//
 	// The ledger alone cannot answer "which card may I take": a card with a training
 	// job nobody claimed looks free, and picking it puts this agent on top of another
-	// job. That is exactly what the manual warns about, and it used to be what `claim`
-	// did — it only observed when the ledger knew no cards at all. One observation per
-	// claim, over the one host involved, is a few seconds.
+	// job. One observation per claim is a few seconds for one host; with no host named
+	// it is every host with cards, which is what placement has to compare.
 	var observed map[string]ledger.Observation
+	var unavailable []string
 	requireIdle := false
-	if *host != "" && !*noObserve {
-		sn, err := observe(*cfgPath, *host, false, *wait, s)
-		if err != nil {
-			// Not fatal when the ledger already knows the host: an explicit -gpu with a
-			// ledger-recorded card can still be honoured, and refusing would make a
-			// transient network failure look like a missing machine.
-			if n, cerr := s.CardCount(*host); cerr != nil || n == 0 {
-				return emitErr(io_.Out, "claim", &ExitError{Status: ExitUnavail, API: &APIError{
-					Code: CodeNoObservation,
-					Message: fmt.Sprintf("%s could not be observed and the ledger knows no "+
-						"cards there: %v", *host, err),
-					Hint: "check that ftop can reach the host, or run `ftop gpu list -host " +
-						*host + "` and read unavailable_hosts.",
-				}})
-			}
-		} else {
-			if err := s.UpsertCards(sn.Cards, sn.Completed...); err != nil {
+	if !*noObserve {
+		// A named card is observed on the host the ledger last saw it on.
+		scope := *host
+		if *uuid != "" && scope == "" {
+			if h, ok, err := s.CardHost(*uuid); err != nil {
 				return emitErr(io_.Out, "claim", classify(err))
+			} else if ok {
+				scope = h
 			}
-			observed, requireIdle = sn.Obs, true
 		}
+		sn, err := observe(*cfgPath, scope, scope == "", *wait, s)
+		// The hosts this claim depends on that did not answer: the named one, or for a
+		// placement every host it may use. Others (a laptop in the same ssh config)
+		// are not this claim's business.
+		for _, h := range sn.Unavailable {
+			if h == scope || (scope == "" && slices.Contains(placeOn, h)) {
+				unavailable = append(unavailable, h)
+			}
+		}
+		// ftop hands out only cards it has just seen idle, so a claim it could not
+		// look for fails as such. It used to fall back to the ledger when the host or
+		// card was already known, which in practice meant a build without a probe
+		// handed out cards silently; -no-ssh is the way to say "the ledger is enough".
+		switch {
+		case err != nil:
+		case scope != "" && len(unavailable) > 0:
+			err = fmt.Errorf("%s did not answer: %s", scope, sn.Errors[scope])
+		case scope == "" && len(placeOn) > 0 && len(unavailable) == len(placeOn):
+			err = fmt.Errorf("none of the %d hosts a claim may be placed on answered",
+				len(placeOn))
+		}
+		if err != nil {
+			return emitClaim(io_.Out, nil, &ExitError{Status: ExitUnavail, API: &APIError{
+				Code: CodeNoObservation,
+				Message: fmt.Sprintf("ftop hands out only cards it has just seen idle, and "+
+					"could not look: %v", err),
+				Hint: "unavailable_hosts names the hosts that did not answer; `ftop gpu list` " +
+					"says why. Retry, or claim elsewhere.",
+			}}, unavailable)
+		}
+		if err := s.UpsertCards(sn.Cards, sn.Completed...); err != nil {
+			return emitErr(io_.Out, "claim", classify(err))
+		}
+		// Close what has expired on a card now seen idle before choosing: an
+		// abandoned claim used to keep its card from claim until someone happened
+		// to run `gpu list`.
+		if _, _, err := s.Sweep(sn.Obs); err != nil {
+			return emitErr(io_.Out, "claim", classify(err))
+		}
+		observed, requireIdle = sn.Obs, true
 	}
 
-	res, err := s.Claim(ledger.ClaimRequest{
-		Host: *host, GPUUUID: *uuid, MinVRAM: *minVRAM,
+	a, err := s.Allocate(ledger.ClaimRequest{
+		Host: *host, GPUUUID: *uuid, Hosts: placeOn, Count: *count, Spread: *spread,
+		Adopt: *adopt, MinVRAM: *minVRAM,
 		Owner: owner, Session: id.Session, Repo: id.Repo, Branch: id.Branch, Cwd: id.Cwd,
 		Why: *why, Note: *note, For: *forDur, Directive: *direct,
 		Observed: observed, RequireIdle: requireIdle,
 	})
 	if err != nil {
-		return emitErr(io_.Out, "claim", classify(err))
+		e := classify(err)
+		if e.API.Code == CodeNoCapacity && len(unavailable) > 0 {
+			e.API.Hint += fmt.Sprintf(" %d host(s) did not answer and were not considered "+
+				"(unavailable_hosts).", len(unavailable))
+		}
+		return emitClaim(io_.Out, nil, e, unavailable)
 	}
+	return emitClaim(io_.Out, newClaimData(a), nil, unavailable)
+}
 
-	c := res.Claim
-	emitOK(io_.Out, "claim", claimData{
-		Claim: c,
-		Card:  res.Card,
-		Env: map[string]string{
-			"FTOP_CLAIM":      c.ID,
-			"FTOP_GPU_UUID":   c.GPUUUID,
-			"FTOP_AGENT":      c.Owner,
-			"FTOP_CLAIM_HOST": c.Host,
-		},
-		Hint: fmt.Sprintf("run your job on %s (%s) on %s, then `ftop release %s`. "+
-			"The claim expires %s; extend it with `ftop renew %s -for 4h` if the job runs longer.",
-			c.GPUUUID, res.Card.Name, c.Host, c.ID,
-			c.Expires.Local().Format("2006-01-02 15:04 MST"), c.ID),
-	})
+// emitClaim writes claim's envelope, which also names the hosts the claim needed and
+// could not observe: a placement made without them, or a refusal because of them,
+// should say so.
+func emitClaim(out io.Writer, data any, e *ExitError, unavailable []string) int {
+	env := Envelope{APIVersion: APIVersion, OK: e == nil, Command: "claim", At: time.Now().UTC(),
+		Unavailable: unavailable}
+	if e != nil {
+		env.Error = e.API
+		write(out, env)
+		return e.Status
+	}
+	env.Data = data
+	write(out, env)
 	return ExitOK
 }
 
-// releaseData is what `ftop release` returns.
+// newClaimData lays an allocation out for the agent: by host, with what to export.
+func newClaimData(a ledger.Allocation) claimData {
+	d := claimData{Group: a.Group, Placement: a.Placement}
+	var all []string
+	at := map[string]int{}
+	for _, r := range a.Claims {
+		d.Claims = append(d.Claims, r.Claim)
+		d.Cards = append(d.Cards, r.Card)
+		all = append(all, r.Card.GPUUUID)
+		i, ok := at[r.Card.Host]
+		if !ok {
+			i = len(d.Hosts)
+			at[r.Card.Host] = i
+			d.Hosts = append(d.Hosts, claimHost{Host: r.Card.Host})
+		}
+		d.Hosts[i].GPUUUIDs = append(d.Hosts[i].GPUUUIDs, r.Card.GPUUUID)
+		d.Hosts[i].ClaimIDs = append(d.Hosts[i].ClaimIDs, r.Claim.ID)
+	}
+	for i := range d.Hosts {
+		// CUDA accepts UUIDs here, and they survive a reboot that renumbers the cards.
+		d.Hosts[i].CUDAVisibleDevices = strings.Join(d.Hosts[i].GPUUUIDs, ",")
+	}
+	d.Claim, d.Card = d.Claims[0], d.Cards[0]
+	// FTOP_CLAIM is the group, which release and renew take like a claim id, so a
+	// script that releases $FTOP_CLAIM lets go of every card it was given.
+	d.Env = map[string]string{
+		"FTOP_CLAIM":    a.Group,
+		"FTOP_AGENT":    d.Claim.Owner,
+		"FTOP_GPU_UUID": strings.Join(all, ","),
+	}
+	expires := d.Claim.Expires.Local().Format("2006-01-02 15:04 MST")
+	if len(d.Hosts) == 1 {
+		h := d.Hosts[0]
+		d.Env["FTOP_CLAIM_HOST"] = h.Host
+		d.Env["CUDA_VISIBLE_DEVICES"] = h.CUDAVisibleDevices
+		d.Hint = fmt.Sprintf("run your job on %s with CUDA_VISIBLE_DEVICES=%s, then "+
+			"`ftop release %s`. The claim expires %s; extend it with `ftop renew %s -for 4h` "+
+			"if the job runs longer.", h.Host, h.CUDAVisibleDevices, a.Group, expires, a.Group)
+		return d
+	}
+	d.Hint = fmt.Sprintf("the %d cards are on %d hosts (see hosts): run each job on its host "+
+		"with that host's cuda_visible_devices. Release a card by its claim id when its job "+
+		"ends, or all of them with `ftop release %s`. The claims expire %s; extend them with "+
+		"`ftop renew %s -for 4h`.", len(d.Cards), len(d.Hosts), a.Group, expires, a.Group)
+	return d
+}
+
+// releaseData is what `ftop release` and `ftop renew` return.
 type releaseData struct {
-	Claim ledger.Claim `json:"claim"`
+	// Claim is the first claim acted on; Claims is all of them, one unless the id
+	// was a group.
+	Claim  ledger.Claim   `json:"claim"`
+	Claims []ledger.Claim `json:"claims"`
+	Group  string         `json:"group,omitempty"`
 }
 
 // runRelease implements `ftop release`.
@@ -174,7 +309,7 @@ func runRelease(io_ IO, args []string) int {
 		return emitErr(io_.Out, "release", usageErr("%v", err))
 	}
 	if claimID == "" {
-		return emitErr(io_.Out, "release", usageErr("usage: ftop release <claim-id>"))
+		return emitErr(io_.Out, "release", usageErr("usage: ftop release <claim-id|group>"))
 	}
 	id := DetectIdentity()
 	owner := id.Name
@@ -222,6 +357,19 @@ func runRelease(io_ IO, args []string) int {
 	if override {
 		cause = "override"
 	}
+	// A group is one command's cards, so it carries one owner: the rule that lets
+	// this caller release one of them lets it release all.
+	if ledger.IsGroupID(claimID) {
+		if !override && *as == "" && id.Known {
+			owner = mineInGroup(s, claimID, id, owner)
+		}
+		cs, err := s.ReleaseGroup(claimID, owner, cause, actor)
+		if err != nil {
+			return emitErr(io_.Out, "release", classify(err))
+		}
+		emitOK(io_.Out, "release", releaseData{Claim: cs[0], Claims: cs, Group: claimID})
+		return ExitOK
+	}
 	// A restart changes this agent's session id but not its kind. Releasing is the
 	// action an agent takes on its own work, so it is allowed across a restart of the
 	// same kind; taking another KIND of agent's card still is not, and -as names an
@@ -246,8 +394,23 @@ func runRelease(io_ IO, args []string) int {
 	if err != nil {
 		return emitErr(io_.Out, "release", classify(err))
 	}
-	emitOK(io_.Out, "release", releaseData{Claim: c})
+	emitOK(io_.Out, "release", releaseData{Claim: c, Claims: []ledger.Claim{c}})
 	return ExitOK
+}
+
+// mineInGroup is the owner to act on a group as: the group's own owner when this
+// identity may release its claims (see mineToRelease), and fallback otherwise.
+func mineInGroup(s *ledger.Store, group string, id Identity, fallback string) string {
+	cs, err := s.Group(group)
+	if err != nil {
+		return fallback
+	}
+	for _, c := range cs {
+		if !c.Closed && mineToRelease(c, id) {
+			return c.Owner
+		}
+	}
+	return fallback
 }
 
 // runRenew implements `ftop renew`.
@@ -264,7 +427,7 @@ func runRenew(io_ IO, args []string) int {
 		return emitErr(io_.Out, "renew", usageErr("%v", err))
 	}
 	if claimID == "" {
-		return emitErr(io_.Out, "renew", usageErr("usage: ftop renew <claim-id> -for 4h"))
+		return emitErr(io_.Out, "renew", usageErr("usage: ftop renew <claim-id|group> -for 4h"))
 	}
 	if *forDur <= 0 {
 		return emitErr(io_.Out, "renew", usageErr("-for is required"))
@@ -288,6 +451,17 @@ func runRenew(io_ IO, args []string) int {
 	// Renew is what an agent does about its own work, so it follows the same rule as
 	// release: the exact owner, or — after a restart — the same runtime in the same
 	// place. A claim `-mine` lists must be one you can act on, renewing included.
+	if ledger.IsGroupID(claimID) {
+		if *as == "" && id.Known {
+			owner = mineInGroup(s, claimID, id, owner)
+		}
+		cs, err := s.RenewGroup(claimID, owner, *forDur)
+		if err != nil {
+			return emitErr(io_.Out, "renew", classify(err))
+		}
+		emitOK(io_.Out, "renew", releaseData{Claim: cs[0], Claims: cs, Group: claimID})
+		return ExitOK
+	}
 	if *as == "" && id.Known {
 		if cur, gerr := s.Get(claimID); gerr == nil && mineToRelease(cur, id) {
 			owner = cur.Owner
@@ -298,7 +472,7 @@ func runRenew(io_ IO, args []string) int {
 	if err != nil {
 		return emitErr(io_.Out, "renew", classify(err))
 	}
-	emitOK(io_.Out, "renew", releaseData{Claim: c})
+	emitOK(io_.Out, "renew", releaseData{Claim: c, Claims: []ledger.Claim{c}})
 	return ExitOK
 }
 

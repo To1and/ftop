@@ -1,9 +1,10 @@
 // Package ledger is ftop's record of who is using which card, and why.
 //
-// It is a ledger, not a scheduler: it never starts, stops, throttles or kills
-// anything. Agents run their own programs; ftop only records claims, releases them
-// when their owner says so or when the declared time runs out and the card is
-// observed idle, and answers "who holds this card".
+// It never starts, stops, throttles or kills anything. Agents run their own
+// programs; ftop records claims, chooses which idle cards a claim gets when the
+// agent does not name them (see place), releases claims when their owner says so or
+// when the declared time runs out and the card is observed idle, and answers "who
+// holds this card".
 //
 // The store is one SQLite database in the user's state directory, in WAL mode. Every
 // command opens it, reading or writing in one transaction, and exits — there is no
@@ -37,7 +38,10 @@ import (
 // observation. A card row is never deleted (its history is the point), so absence
 // has to be recorded on the row or a card that left the fleet stays claimable
 // forever.
-const SchemaVersion = 2
+//
+// 3 adds claims.grp: the cards one claim command took, released and renewed
+// together.
+const SchemaVersion = 3
 
 // Errors callers act on. They are values, not strings, so the CLI can map them to
 // stable exit codes without matching on prose.
@@ -49,6 +53,8 @@ var (
 	ErrSchemaTooNew  = errors.New("ledger was written by a newer ftop")
 	ErrNoSuchCard    = errors.New("no such card")
 	ErrAlreadyClosed = errors.New("lease is already closed")
+	ErrNoCapacity    = errors.New("not enough idle cards")
+	ErrNotIdle       = errors.New("card is in use by work nobody claimed")
 )
 
 // Claim is one lease on one card.
@@ -78,6 +84,10 @@ type Claim struct {
 	// Directives are the operator's own instructions that produced this claim
 	// ("use gpu-4", "take 2 cards"). They outrank any agent-to-agent negotiation.
 	Directive string `json:"directive,omitempty"`
+	// Group is shared by every card one claim command took. Release and renew
+	// accept it, so a job on four cards is let go of in one step rather than four,
+	// and cannot leave one card behind. Claims made before groups existed have none.
+	Group string `json:"group,omitempty"`
 }
 
 // Store is the ledger database.
@@ -210,32 +220,46 @@ func (s *Store) migrate() error {
 	if v == SchemaVersion {
 		return nil
 	}
+	// Migrations run in one write transaction with the version bump, and the version
+	// is read again once the lock is held.
+	//
+	// Every agent on the machine runs a new build at once after an upgrade, so several
+	// processes open an old ledger together. Run outside a transaction, two of them
+	// both saw the old version and both added the column, and the loser failed on
+	// "duplicate column"; an interruption between the ALTER and the version bump left
+	// a file no build could open again.
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("ledger: %w", err)
+	}
+	defer tx.Rollback()
+	if err := tx.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		return fmt.Errorf("ledger: %w", err)
+	}
+	if v >= SchemaVersion {
+		return nil // another process migrated it while this one waited
+	}
 	// Migrations are additive and ordered. v1 created the original shape; v2 adds
-	// cards.present. A fresh database runs both.
-	if v < 1 {
-		if err := s.run(v1Schema); err != nil {
-			return err
+	// cards.present; v3 adds claims.grp. A fresh database runs them all.
+	for _, m := range []struct {
+		to    int
+		stmts []string
+	}{{1, v1Schema}, {2, v2Schema}, {3, v3Schema}} {
+		if v >= m.to {
+			continue
 		}
-		v = 1
+		// One statement per call: the driver does not run multi-statement strings.
+		for _, q := range m.stmts {
+			if _, err := tx.Exec(q); err != nil {
+				return fmt.Errorf("ledger: migrate to v%d: %w", m.to, err)
+			}
+		}
 	}
-	if v < 2 {
-		if err := s.run(v2Schema); err != nil {
-			return err
-		}
-		v = 2
+	if _, err := tx.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, SchemaVersion)); err != nil {
+		return fmt.Errorf("ledger: %w", err)
 	}
-	_, err := s.db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, SchemaVersion))
-	return err
-}
-
-// run executes migration statements, one per call: the driver does not run
-// multi-statement strings, and splitting a schema across calls makes a partial
-// migration visible.
-func (s *Store) run(stmts []string) error {
-	for _, q := range stmts {
-		if _, err := s.db.Exec(q); err != nil {
-			return fmt.Errorf("ledger: migrate: %w", err)
-		}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("ledger: %w", err)
 	}
 	return nil
 }
@@ -297,6 +321,13 @@ var v2Schema = []string{
 	`ALTER TABLE cards ADD COLUMN gone_since_ns INTEGER NOT NULL DEFAULT 0`,
 }
 
+var v3Schema = []string{
+	// Empty for every earlier claim: those were taken one card at a time, and each is
+	// still released by its own id.
+	`ALTER TABLE claims ADD COLUMN grp TEXT NOT NULL DEFAULT ''`,
+	`CREATE INDEX IF NOT EXISTS claims_by_group ON claims(grp) WHERE grp != ''`,
+}
+
 // sanitizeText makes a free-text field safe to store and display.
 //
 // The reason field is written by an agent, so it is attacker-controlled as far as
@@ -348,14 +379,23 @@ func nowNS() int64 { return time.Now().UnixNano() }
 // newID is a short, sortable claim id: time plus a random suffix. Agents quote it in
 // messages to each other and humans type it, so it has to be short; it also has to
 // sort by creation time, because the ledger is read newest-first.
-func newID(t time.Time) string {
+func newID(t time.Time) string { return stampedID("L", t) }
+
+// newGroupID names the cards one claim command took. The G prefix is what lets
+// release and renew tell a group from a single claim.
+func newGroupID(t time.Time) string { return stampedID("G", t) }
+
+// IsGroupID reports whether an id names a group rather than one claim.
+func IsGroupID(id string) bool { return strings.HasPrefix(id, "G") }
+
+func stampedID(prefix string, t time.Time) string {
 	var b [4]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		// A predictable id is not a security problem here (nothing is authorised by
 		// knowing one), but it must still be unique.
 		binary.BigEndian.PutUint32(b[:], uint32(t.UnixNano()))
 	}
-	return "L" + t.UTC().Format("20060102T150405") + "-" + hex.EncodeToString(b[:])
+	return prefix + t.UTC().Format("20060102T150405") + "-" + hex.EncodeToString(b[:])
 }
 
 func fromNS(ns int64) time.Time {
