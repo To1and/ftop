@@ -202,6 +202,8 @@ single authority, and watching a card needs nothing installed on the hosts.
 ```sh
 ftop claim -n 2 -why "train ~3h" -for 3h      # ftop picks the machine: the closest fit
 ftop claim -n 8 -spread -why "sweep" -for 3h  # 8 separate one-card jobs, any machines
+ftop claim -n 4..40 -spread -why "sweep" -for 3h  # as many as are idle, at least 4
+ftop claim -n 2 -exclude-host gpu-4 -why "…" -for 3h  # anywhere but that machine
 ftop claim -host <host> -n 2 -why "…" -for 3h # on the machine the operator named
 ftop release G20260101T120000-1a2b3c4d        # every card the claim took
 ftop gpu list -safe                  # cards free AND idle
@@ -218,10 +220,13 @@ partly in use, then the smaller machine. Two cards go to a two-card machine rath
 than into an eight-card one, and a single card fills the last free slot of a busy
 machine before it opens an idle one, so whole machines stay free for the jobs that
 need them. The cards are all on one machine unless `-spread` says they are
-separate jobs, and the claim takes all of them or none: too few idle cards is
-`no_capacity`, with the most one machine and the fleet could give. Hosts listed
-under `[claim] manual` in config.toml are monitored and claimable by name, but
-never chosen.
+separate jobs. A count is all-or-none: too few idle cards is `no_capacity`, with
+the most one machine and the fleet could give. A range (`-n 4..40`) is the sweep
+shape instead — at least the first number, at most the second, as many as are
+idle — and the reply says what it asked for and what it got, so the job is sized
+for the cards it actually received. Hosts listed under `[claim] manual` in
+config.toml are monitored and claimable by name, but never chosen; `-exclude-host`
+keeps a single claim off a machine without touching the config.
 
 `ftop skill install` writes the manual once and links it into every agent runtime
 present on the machine — `~/.claude/skills`, `~/.codex/skills`, `~/.cursor/skills`,
@@ -259,9 +264,17 @@ Rules enforced rather than documented:
   processes are yours), and a claim that could not observe is `no_observation`
   rather than a card nobody looked at. `-no-ssh` is the explicit way to choose
   from the ledger alone.
-- **A deadline is not an eviction.** An overdue claim keeps its card. It is
-  closed only when `claim`, `gpu list` or `gpu show` observes that card idle; a
-  process list that could not be read is never read as "idle".
+- **Neither a deadline nor an idle card evicts a running job.** A claim is closed
+  automatically in exactly two cases, and both need an observation of that card
+  that enumerated its processes and found none: its deadline passed, or the card
+  has shown no work for 30 minutes. The second rule is what makes a shared fleet
+  usable — agents ask for hours more than they use (the ledger's own history: a
+  median ask of 14 hours for work released after 45 minutes), so an agent that
+  finished and forgot held a card nobody else could have until its deadline. A
+  claim that is idle on purpose is safe: `-keep` (or `ftop keep`) turns the
+  reclaim off, and renewing restarts the clock. A process list that could not be
+  read is never read as "idle", and a card with a job on it is never reclaimed,
+  overdue or not.
 - **Only the holder releases.** An agent's identity is `<agent>/<session>`; a
   restarted agent of the same kind may release its own earlier claims, another
   kind may not. `release -any-owner` is the operator's override and is recorded

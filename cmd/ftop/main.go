@@ -379,7 +379,7 @@ func readLedger(path string) *ui.LedgerMsg {
 // flag parser's error rather than silently becoming one.
 func isSubcommand(s string) bool {
 	switch s {
-	case "gpu", "claim", "release", "renew", "history", "host", "whoami", "skill",
+	case "gpu", "claim", "release", "renew", "keep", "history", "host", "whoami", "skill",
 		"help", "version":
 		return true
 	}

@@ -45,6 +45,8 @@ func MainInto(out io.Writer, args []string) int {
 		return runRelease(io_, rest)
 	case "renew":
 		return runRenew(io_, rest)
+	case "keep":
+		return runKeep(io_, rest)
 	case "whoami":
 		return runWhoami(io_, rest)
 	case "host":
@@ -224,12 +226,15 @@ before it starts.
   ftop gpu list [-host H] [-safe|-free|-held] [-no-ssh]
   ftop gpu show <uuid|host:index>
   ftop gpu why [-host H]      one line per card: who holds it, and why
-  ftop claim -why "…" -for 2h [-n N] [-spread] [-min-vram MIB] [-directive "…"]
-                              ftop chooses where: the closest fit, all N or none
+  ftop claim -why "…" -for 2h [-n N|MIN..MAX] [-spread] [-min-vram MIB]
+             [-exclude-host H] [-keep] [-directive "…"]
+                              ftop chooses where: the closest fit, all or none.
+                              MIN..MAX takes as many as are idle, at least MIN.
   ftop claim -host H -why "…" -for 2h [-n N]     on that machine
   ftop claim -gpu UUID -why "…" -for 2h [-adopt] that card
   ftop release <group|claim-id>
   ftop renew <group|claim-id> -for 4h
+  ftop keep <group|claim-id> [-off]   keep it while idle, or stop keeping it
   ftop claim list [-mine]
   ftop history <gpu-uuid> [-n 20]
   ftop host                   every machine, its label, and its free cards
@@ -244,6 +249,8 @@ Every command prints JSON on stdout. Errors carry a stable "code"; exit status
 Rules that matter:
   - let ftop choose the cards: it takes only cards it has just seen idle, and
     keeps whole machines free for jobs that need them. Release when done.
+  - a claim whose card shows no work for 30 minutes is taken back before its
+    deadline. Renew between jobs, or claim with -keep.
   - "gpu list -safe" lists what is free and idle; -free includes cards another
     job is already running on
   - if ftop cannot tell which agent you are, it refuses the claim: set FTOP_AGENT

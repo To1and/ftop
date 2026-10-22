@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +29,8 @@ type claimData struct {
 	Hosts []claimHost `json:"hosts"`
 	// Placement says why these cards: named, or chosen, and against what.
 	Placement ledger.Placement `json:"placement"`
+	// Requested is set for an elastic claim (-n MIN..MAX): the range and what it got.
+	Requested *ledger.Requested `json:"requested,omitempty"`
 	// Env is the environment the agent should export for its own process. It is
 	// informational: ftop does not run the job, so nothing enforces it. Session id and
 	// card UUID are there so a later `ftop gpu show` can line an observation up with
@@ -45,6 +48,67 @@ type claimHost struct {
 	CUDAVisibleDevices string   `json:"cuda_visible_devices"`
 }
 
+// countRange is -n's value: a count, or a range such as 4..40.
+//
+// One flag rather than -min/-max, because "how many cards" is one question and two
+// flags make it possible to say contradictory things with it. A range is elastic: at
+// least the first number, at most the second, as many as are idle — which is what a
+// sweep wants, and what the all-or-none form could not express without the agent
+// counting the fleet first and losing the batch to one card taken in between.
+type countRange struct {
+	lo, hi int
+	// bad is the value that could not be read. The flag package cannot report it:
+	// a failed Set makes it print its own usage to stderr, and stdout must carry
+	// JSON and nothing else, so the value is remembered for runClaim to refuse.
+	bad string
+}
+
+func (c *countRange) String() string {
+	if c == nil || c.hi == 0 {
+		return "1"
+	}
+	if c.lo == c.hi {
+		return strconv.Itoa(c.lo)
+	}
+	return fmt.Sprintf("%d..%d", c.lo, c.hi)
+}
+
+func (c *countRange) Set(s string) error {
+	lo, hi, ranged := strings.Cut(s, "..")
+	parse := func(v string) int {
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		if err != nil {
+			c.bad = strings.TrimSpace(v)
+			return 0
+		}
+		return n
+	}
+	c.lo = parse(lo)
+	c.hi = c.lo
+	c.bad = ""
+	if !ranged {
+		return nil
+	}
+	c.hi = parse(hi)
+	return nil
+}
+
+// elastic reports whether the request takes as many cards as are idle.
+func (c *countRange) elastic() bool { return c.hi != c.lo }
+
+// listFlag is a repeatable string flag.
+type listFlag []string
+
+func (l *listFlag) String() string { return strings.Join(*l, ",") }
+
+func (l *listFlag) Set(v string) error {
+	if v = strings.TrimSpace(v); v == "" {
+		return fmt.Errorf("an empty value names nothing")
+	}
+	*l = append(*l, v)
+	return nil
+}
+
 // runClaim implements `ftop claim`.
 func runClaim(io_ IO, args []string) int {
 	fs := flag.NewFlagSet("claim", flag.ContinueOnError)
@@ -52,10 +116,12 @@ func runClaim(io_ IO, args []string) int {
 	var (
 		host    = fs.String("host", "", "take the cards on this host (default: ftop chooses)")
 		uuid    = fs.String("gpu", "", "take this exact card")
-		count   = fs.Int("n", 1, "how many cards; all of them or none")
+		count   = &countRange{lo: 1, hi: 1}
 		spread  = fs.Bool("spread", false, "the cards may be on different hosts: separate one-card jobs")
 		adopt   = fs.Bool("adopt", false, "with -gpu: take the card although processes run on it, because they are yours")
 		minVRAM = fs.Uint64("min-vram", 0, "minimum card memory in MiB")
+		keep    = fs.Bool("keep", false,
+			"keep the card while it is idle: preparing work on the CPU, holding it for a next stage")
 		// No default: a claim with a guessed duration is a claim whose deadline
 		// nobody chose. The flag is required and checked below.
 		forDur    = fs.Duration("for", 0, "how long the claim is meant to last (required)")
@@ -68,21 +134,36 @@ func runClaim(io_ IO, args []string) int {
 			"do not observe; choose from the ledger alone, without checking that cards are idle")
 		cfgPath = fs.String("config", "", "config.toml path")
 		wait    = fs.Duration("wait", 8*time.Second, "how long to collect an observation")
+		exclude listFlag
 	)
+	fs.Var(count, "n", "how many cards: N for all-or-none, or MIN..MAX for as many as are idle")
+	fs.Var(&exclude, "exclude-host", "never place on this host (repeatable)")
 	if err := parseFlags(fs, args); err != nil {
 		return emitErr(io_.Out, "claim", usageErr("%v", err))
 	}
 	switch {
-	case *count < 1:
+	case count.bad != "":
+		return emitErr(io_.Out, "claim", usageErr("-n %q: a card count is a whole "+
+			"number, or MIN..MAX", count.bad))
+	case count.lo < 1:
 		return emitErr(io_.Out, "claim", usageErr("-n must be at least 1"))
-	case *uuid != "" && *count > 1:
+	case count.hi < count.lo:
+		return emitErr(io_.Out, "claim", usageErr("-n %s: the maximum is below the "+
+			"minimum", count))
+	case *uuid != "" && count.hi > 1:
 		return emitErr(io_.Out, "claim", usageErr("-gpu names one card; for several on one "+
 			"machine use -host H -n N"))
 	case *spread && (*host != "" || *uuid != ""):
 		return emitErr(io_.Out, "claim", usageErr("-spread lets ftop place the cards; it "+
 			"cannot be combined with -host or -gpu"))
+	case count.elastic() && (*host != "" || *uuid != ""):
+		return emitErr(io_.Out, "claim", usageErr("a card range is placed by ftop; it "+
+			"cannot be combined with -host or -gpu"))
 	case *adopt && *uuid == "":
 		return emitErr(io_.Out, "claim", usageErr("-adopt takes one card by name; give it with -gpu"))
+	case len(exclude) > 0 && (*host != "" || *uuid != ""):
+		return emitErr(io_.Out, "claim", usageErr("-exclude-host is for a placement; the "+
+			"host or card is already named"))
 	}
 	if *why == "" {
 		return emitErr(io_.Out, "claim", usageErr("-why is required: it is the only record of "+
@@ -98,6 +179,13 @@ func runClaim(io_ IO, args []string) int {
 		return emitErr(io_.Out, "claim", rerr)
 	} else {
 		*host = alias
+	}
+	for i, h := range exclude {
+		alias, rerr := resolveHost(*cfgPath, h)
+		if rerr != nil {
+			return emitErr(io_.Out, "claim", rerr)
+		}
+		exclude[i] = alias
 	}
 
 	id := DetectIdentity()
@@ -140,16 +228,18 @@ func runClaim(io_ IO, args []string) int {
 	}
 
 	// With no host and no card named, ftop places the claim, on any host the user has
-	// not marked manual.
+	// not marked manual and this claim did not exclude.
 	var placeOn []string
+	fleet := 0
 	if *host == "" && *uuid == "" {
 		cfg, err := config.Load(expandHome(*cfgPath))
 		if err != nil {
 			return emitErr(io_.Out, "claim", usageErr("%v", err))
 		}
+		fleet = len(cfg.Hosts)
 		placeOn = []string{}
 		for _, h := range cfg.Hosts {
-			if !h.Manual {
+			if !h.Manual && !slices.Contains(exclude, h.Name) {
 				placeOn = append(placeOn, h.Name)
 			}
 		}
@@ -174,7 +264,21 @@ func runClaim(io_ IO, args []string) int {
 				scope = h
 			}
 		}
-		sn, err := observe(*cfgPath, scope, scope == "", *wait, s)
+		// A placement observes only the hosts it may place on. When the fleet has
+		// hosts but every one is manual or excluded, that is the caller's decision and
+		// there is nothing to look at: the claim answers no_capacity below without
+		// contacting anything. A fleet with no hosts at all is a configuration that
+		// could not be read, and observing reports it.
+		var sn snapshot
+		var err error
+		switch {
+		case scope != "":
+			sn, err = observe(*cfgPath, scope, false, *wait, s)
+		case len(placeOn) > 0 || fleet == 0:
+			sn, err = observeHosts(*cfgPath, "", placeOn, true, *wait, s)
+		default:
+			sn = snapshot{Obs: map[string]ledger.Observation{}}
+		}
 		// The hosts this claim depends on that did not answer: the named one, or for a
 		// placement every host it may use. Others (a laptop in the same ssh config)
 		// are not this claim's business.
@@ -217,8 +321,9 @@ func runClaim(io_ IO, args []string) int {
 	}
 
 	a, err := s.Allocate(ledger.ClaimRequest{
-		Host: *host, GPUUUID: *uuid, Hosts: placeOn, Count: *count, Spread: *spread,
-		Adopt: *adopt, MinVRAM: *minVRAM,
+		Host: *host, GPUUUID: *uuid, Hosts: placeOn, ExcludeHosts: exclude,
+		Count: count.lo, Max: count.hi, Spread: *spread,
+		Adopt: *adopt, MinVRAM: *minVRAM, Keep: *keep,
 		Owner: owner, Session: id.Session, Repo: id.Repo, Branch: id.Branch, Cwd: id.Cwd,
 		Why: *why, Note: *note, For: *forDur, Directive: *direct,
 		Observed: observed, RequireIdle: requireIdle,
@@ -273,6 +378,14 @@ func newClaimData(a ledger.Allocation) claimData {
 		d.Hosts[i].CUDAVisibleDevices = strings.Join(d.Hosts[i].GPUUUIDs, ",")
 	}
 	d.Claim, d.Card = d.Claims[0], d.Cards[0]
+	// An elastic claim that got less than it asked for has to say so: the caller's job
+	// must be sized for what it received, not for what it requested.
+	d.Requested = a.Placement.Range
+	short := ""
+	if r := a.Placement.Range; r != nil {
+		short = fmt.Sprintf(" %d card(s) were idle, so this is %d of the %d..%d asked for; "+
+			"size the job for %d.", r.Got, r.Got, r.Min, r.Max, r.Got)
+	}
 	// FTOP_CLAIM is the group, which release and renew take like a claim id, so a
 	// script that releases $FTOP_CLAIM lets go of every card it was given.
 	d.Env = map[string]string{
@@ -281,19 +394,28 @@ func newClaimData(a ledger.Allocation) claimData {
 		"FTOP_GPU_UUID": strings.Join(all, ","),
 	}
 	expires := d.Claim.Expires.Local().Format("2006-01-02 15:04 MST")
+	reclaim := " If nothing runs on a card for 30 minutes, ftop takes it back, so keep" +
+		" this claim by renewing it if you are between jobs: `ftop renew " + a.Group +
+		" -for 4h`, or start the job with -keep."
+	if d.Claim.Keep {
+		reclaim = " The card is kept while idle (-keep), so it is yours until you release" +
+			" it or the deadline passes."
+	}
 	if len(d.Hosts) == 1 {
 		h := d.Hosts[0]
 		d.Env["FTOP_CLAIM_HOST"] = h.Host
 		d.Env["CUDA_VISIBLE_DEVICES"] = h.CUDAVisibleDevices
 		d.Hint = fmt.Sprintf("run your job on %s with CUDA_VISIBLE_DEVICES=%s, then "+
 			"`ftop release %s`. The claim expires %s; extend it with `ftop renew %s -for 4h` "+
-			"if the job runs longer.", h.Host, h.CUDAVisibleDevices, a.Group, expires, a.Group)
+			"if the job runs longer.%s%s", h.Host, h.CUDAVisibleDevices, a.Group, expires,
+			a.Group, reclaim, short)
 		return d
 	}
 	d.Hint = fmt.Sprintf("the %d cards are on %d hosts (see hosts): run each job on its host "+
 		"with that host's cuda_visible_devices. Release a card by its claim id when its job "+
 		"ends, or all of them with `ftop release %s`. The claims expire %s; extend them with "+
-		"`ftop renew %s -for 4h`.", len(d.Cards), len(d.Hosts), a.Group, expires, a.Group)
+		"`ftop renew %s -for 4h`.%s%s", len(d.Cards), len(d.Hosts), a.Group, expires, a.Group,
+		reclaim, short)
 	return d
 }
 
@@ -304,6 +426,55 @@ type releaseData struct {
 	Claim  ledger.Claim   `json:"claim"`
 	Claims []ledger.Claim `json:"claims"`
 	Group  string         `json:"group,omitempty"`
+}
+
+// runKeep implements `ftop keep`, which turns idle reclaim on or off for a claim or a
+// group.
+func runKeep(io_ IO, args []string) int {
+	fs := flag.NewFlagSet("keep", flag.ContinueOnError)
+	fs.SetOutput(io_.Err)
+	var (
+		off     = fs.Bool("off", false, "turn reclaim back on")
+		as      = fs.String("as", "", "identity to act as (default: detected)")
+		storeAt = fs.String("store", "", "ledger path")
+	)
+	claimID, err := parsePositional(fs, args)
+	if err != nil {
+		return emitErr(io_.Out, "keep", usageErr("%v", err))
+	}
+	if claimID == "" {
+		return emitErr(io_.Out, "keep", usageErr("usage: ftop keep <claim-id|group> [-off]"))
+	}
+	id := DetectIdentity()
+	owner := id.Name
+	if *as != "" {
+		owner = *as
+		id.Known = true
+	}
+	if err := requireIdentity(id, "changing a claim"); err != nil {
+		return emitErr(io_.Out, "keep", err)
+	}
+	s, err := ledger.Open(storePath(*storeAt))
+	if err != nil {
+		return emitErr(io_.Out, "keep", classify(err))
+	}
+	defer s.Close()
+	// Same rule as release and renew: the exact owner, or the same runtime in the same
+	// place after a restart. Changing a claim is an action on one's own work, and a
+	// group follows the rule like a single claim does.
+	if *as == "" && id.Known {
+		if ledger.IsGroupID(claimID) {
+			owner = mineInGroup(s, claimID, id, owner)
+		} else if cur, gerr := s.Get(claimID); gerr == nil && mineToRelease(cur, id) {
+			owner = cur.Owner
+		}
+	}
+	cs, err := s.SetKeep(claimID, owner, !*off)
+	if err != nil {
+		return emitErr(io_.Out, "keep", classify(err))
+	}
+	emitOK(io_.Out, "keep", releaseData{Claim: cs[0], Claims: cs, Group: claimID})
+	return ExitOK
 }
 
 // runRelease implements `ftop release`.

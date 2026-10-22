@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -548,6 +549,16 @@ type snapshot struct {
 // cardsOnly skips hosts a recent full pass found no cards on (see readCPUOnly); store
 // may be nil, which disables both the skip and the cache.
 func observe(cfgPath, hostFilter string, cardsOnly bool, wait time.Duration, store *ledger.Store) (snapshot, error) {
+	return observeHosts(cfgPath, hostFilter, nil, cardsOnly, wait, store)
+}
+
+// observeHosts is observe limited to the hosts in only, when only is not nil. A claim
+// placement uses it: the hosts it may place on are the only ones whose cards change
+// its answer, and asking the rest — a manual workstation, an excluded machine, a
+// laptop in the same ssh config — cost time and could fail the claim for a machine it
+// was never going to use.
+func observeHosts(cfgPath, hostFilter string, only []string, cardsOnly bool, wait time.Duration,
+	store *ledger.Store) (snapshot, error) {
 	out := snapshot{
 		Obs:    map[string]ledger.Observation{},
 		Procs:  map[string][]wire.Proc{},
@@ -567,10 +578,15 @@ func observe(cfgPath, hostFilter string, cardsOnly bool, wait time.Duration, sto
 	if cardsOnly && hostFilter == "" && store != nil {
 		skip = readCPUOnly(store.Path(), time.Now())
 	}
-	fullPass := hostFilter == "" && skip == nil && store != nil
+	// A pass limited to some hosts says nothing about the others, so it must not
+	// record which hosts have no cards: that cache is only for a full pass.
+	fullPass := hostFilter == "" && skip == nil && store != nil && only == nil
 	var hosts []config.Host
 	for _, h := range cfg.Hosts {
 		if hostFilter != "" && !strings.EqualFold(h.Name, hostFilter) {
+			continue
+		}
+		if only != nil && !slices.Contains(only, h.Name) {
 			continue
 		}
 		out.Labels[h.Name] = h.Label

@@ -136,7 +136,8 @@ func (s *Store) List(opt ListOptions) ([]CardView, error) {
 	q := `SELECT c.gpu_uuid, c.host, c.idx, c.name, c.mem_total, c.first_seen, c.last_seen,
 		c.present,
 		k.id, k.owner, k.session, k.repo, k.branch, k.cwd, k.why, k.note, k.directive,
-		k.created_ns, k.updated_ns, k.expires_ns, k.closed, k.close_cause, k.closed_ns, k.grp
+		k.created_ns, k.updated_ns, k.expires_ns, k.closed, k.close_cause, k.closed_ns, k.grp,
+		k.last_busy_ns, k.keep
 		FROM cards c
 		LEFT JOIN claims k ON k.gpu_uuid = c.gpu_uuid AND k.closed = 0`
 	var args []any
@@ -175,10 +176,13 @@ func (s *Store) List(opt ListOptions) ([]CardView, error) {
 			cause    sql.NullString
 			closedNS sql.NullInt64
 			group    sql.NullString
+			busyNS   sql.NullInt64
+			keep     sql.NullInt64
 		)
 		if err := rows.Scan(&v.GPUUUID, &v.Host, &v.Index, &v.Name, &v.MemTotal, &fs, &ls,
 			&v.Present, &claimID, &owner, &session, &repo, &branch, &cwd, &why, &note, &direct,
-			&created, &updated, &expires, &closed, &cause, &closedNS, &group); err != nil {
+			&created, &updated, &expires, &closed, &cause, &closedNS, &group, &busyNS,
+			&keep); err != nil {
 			return nil, fmt.Errorf("ledger: %w", err)
 		}
 		v.FirstSeen, v.LastSeen = fromNS(fs), fromNS(ls)
@@ -192,6 +196,7 @@ func (s *Store) List(opt ListOptions) ([]CardView, error) {
 				Expires: fromNS(expires.Int64),
 				Closed:  closed.Int64 == 1, CloseCause: cause.String,
 				ClosedAt: fromNS(closedNS.Int64), Group: group.String,
+				LastBusy: fromNS(busyNS.Int64), Keep: keep.Int64 == 1,
 			}
 			v.Claim = c
 		}
@@ -249,6 +254,30 @@ func (o Observation) Idle() bool {
 func (o Observation) Hidden() bool {
 	return o.UnattributedMiB > UnattributedThreshold(o.MemTotalMiB)
 }
+
+// Working reports positive evidence of work on the card: a process this host can see,
+// or memory no process accounts for. Each counts on its own — a sample whose memory
+// query failed but whose process list shows a job is still proof the job ran, and
+// discarding it let the idle clock start from an older time. False is not the same as
+// idle: an observation that read neither proves nothing either way.
+func (o Observation) Working() bool {
+	return (o.ProcsKnown && o.Procs > 0) || (o.MemKnown && o.Hidden())
+}
+
+// IdleReclaimAfter is how long a held card may show no work before its claim is
+// treated as abandoned and released.
+//
+// A deadline alone is the wrong clock. Agents ask for far more time than they use —
+// the ledger's own history, 241 claims over two days, has a median ask of 14 hours for
+// work that was released after a median of 45 minutes — so a card whose job ended and
+// whose holder forgot to release it sat until its deadline, hours later, while other
+// agents were told there was no capacity. One sweep of the same history found 33 cards
+// held that way and reclaimed only when their 13-hour deadlines passed.
+//
+// The clock is evidence, not intent: only an observation that enumerated the card and
+// found nothing on it counts, and a claim the holder keeps renewing starts over from
+// each renewal, because that is the holder saying it is still wanted.
+const IdleReclaimAfter = 30 * time.Minute
 
 // Annotate joins observations onto a listing and states, in one line, how the ledger
 // and the card disagree.

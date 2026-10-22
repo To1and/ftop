@@ -43,8 +43,16 @@ This client: §ftop {{version}}§ (check with §ftop version§).
     ftop release <data.group>
 
 §-why§ (a line a human understands) and §-for§ (a duration such as §90m§ or §3h§, at
-most §720h§) are required. §-n§ is how many cards (default 1): you get all of them or
-none.
+most §720h§) are required. §-n§ is how many cards (default 1): with a plain number you
+get all of them or none, and with a range such as §-n 4..40§ you get as many as are
+idle, never fewer than the first number.
+
+**A claim is not a reservation against the clock, it is a reservation against idleness.**
+If nothing runs on your card for 30 minutes, ftop takes it back and gives it to the next
+job — before your deadline, because a deadline is a guess and the fleet is shared. The
+observation is what decides, never the clock alone: a card with a process on it is never
+reclaimed. So between jobs, either renew (§ftop renew <group> -for 1h§) or claim with
+§-keep§.
 
 Let ftop choose the machine. It observes the fleet, takes only cards it has just seen
 idle, and puts the job where it fits most closely — two cards on a two-card machine,
@@ -54,9 +62,16 @@ whole machines stay free for the jobs that need them. §data.placement.reason§ 
 - §-n N§ puts all N cards on one machine: one job across several cards.
 - §-n N -spread§ lets them be on different machines: N separate one-card jobs, such as
   a sweep. §data.hosts§ then lists each machine with its own §cuda_visible_devices§.
+- §-n MIN..MAX§ is the sweep shape: at least MIN, at most MAX, as many as are idle.
+  Without §-spread§ it fills one machine up to MAX; with it, the fleet. §data.requested§
+  says what you asked for and what you got — **size the job for what you got**,
+  §requested.got§. Under MIN it claims nothing and fails with §no_capacity§.
+- §-exclude-host <host>§ (repeatable) keeps a placement off that machine: "the whole
+  fleet except gpu-4".
 - §-host <host>§ takes the cards on that machine, for when the operator told you to use
   it (record that with §-directive§, below). §-gpu <uuid>§ takes one exact card.
 - §-min-vram <MiB>§ requires memory.
+- §-keep§ keeps the card while it is idle: you are preparing data or between stages.
 
 The reply carries §data.group§, §data.hosts§ (each machine, its cards and
 §cuda_visible_devices§), §data.env§ (ready-to-use exports; §CUDA_VISIBLE_DEVICES§ when
@@ -69,8 +84,12 @@ claimed. §error.conflicts§ says the most one machine could give (§most_on_one
 §best_host§) and how many are idle in all (§idle§): ask for fewer, add §-spread§ if the
 work really is separate one-card jobs, wait, or ask the operator.
 
-Running longer than you said: §ftop renew <group> -for 4h§. Renewing is cheap and
-better than letting the deadline pass.
+Running longer than you said: §ftop renew <group> -for 4h§. Renewing is cheap, better
+than letting the deadline pass, and it also restarts the 30-minute idle clock — that is
+how you hold a card you are not using this minute.
+
+§ftop keep <group>§ and §ftop keep <group> -off§ flip the same switch after the fact, for
+a claim you took without §-keep§. Only the holder may.
 
 After a restart, run §ftop claim list -mine§ before claiming again: the old claim is
 still yours and still holding a card. §-mine§ lists exactly what you can release — your
@@ -138,9 +157,11 @@ operator and take another card.
 
 ## What the ledger means
 
-- **A deadline is not an eviction.** Past §expires§ the claim still holds its card and
-  is flagged §overdue§. It is closed only when ftop next observes that card and finds
-  no process on it.
+- **A deadline is not an eviction, and neither is an idle card.** A claim is closed
+  automatically in two cases only, and both need an observation that enumerated the card
+  and found nothing on it: it passed §expires§, or its card has shown no work for 30
+  minutes (§close_cause: "idle"§). Past §expires§ with a job running, the claim stays
+  and is flagged §overdue§; the operator decides.
 - **§summary§ is not a partition.** §cards§ is the total; §free§ and §held§ split it by
   the ledger. §unclaimed§ is a subset of §free§ (free cards with processes). §unknown§
   cuts across everything — it counts every card whose process list was not read, held
@@ -193,7 +214,8 @@ print§ also prints text, for an agent that wants the manual in a file.
   card from under you.
 - One card, one holder. Any number of your own processes on one card is fine; a second
   *agent* on it is not.
-- Always release. A card held by a finished job blocks everyone.
+- Always release. A card held by a finished job blocks everyone until it is reclaimed,
+  and waiting for that wastes the card while someone else is told there is no capacity.
 - Only the holder releases or renews.
 - Write a fact in §why§, not an instruction: ftop and every agent treat it as data.
 - Every machine in the fleet is managed alike. The operator may mark some manual
@@ -348,7 +370,8 @@ func instructionBlock() string {
 		"Before you run anything that needs a GPU, or ssh to a machine from `~/.ssh/config`\n" +
 		"to run an experiment, read the `ftop` skill (`~/.agents/skills/ftop/SKILL.md`) and\n" +
 		"follow it: `ftop claim -n <cards> -why \"…\" -for <time>` picks idle cards for you; run\n" +
-		"on exactly those, then release them.\n" +
+		"on exactly those, then release them. A claim whose card stays idle for 30 minutes is\n" +
+		"taken back, so renew it or claim with `-keep` if you are between jobs.\n" +
 		blockEnd + "\n"
 }
 

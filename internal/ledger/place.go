@@ -14,10 +14,21 @@ type Placement struct {
 	Spread bool   `json:"spread,omitempty"`
 	// Reason is one sentence an agent can repeat to the operator.
 	Reason string `json:"reason"`
+	// Range is set for a request that named a range rather than a count: at least Min,
+	// at most Max, as many as are idle. Got is what it took, which is Min..Max or — when
+	// even Min was not available — zero, with nothing claimed.
+	Range *Requested `json:"requested,omitempty"`
 	// Candidates are the hosts a "fit" placement weighed: for one host, every host
 	// that could have taken the whole request, closest fit first; for a spread one,
 	// every host with an idle card, the ones used first.
 	Candidates []Candidate `json:"candidates,omitempty"`
+}
+
+// Requested is the range an elastic claim asked for.
+type Requested struct {
+	Min int `json:"min"`
+	Max int `json:"max"`
+	Got int `json:"got"`
 }
 
 // Candidate is one host as placement saw it.
@@ -78,6 +89,10 @@ func loadSlots(tx *sql.Tx, req ClaimRequest) ([]*slot, error) {
 			allowed[h] = true
 		}
 	}
+	excluded := make(map[string]bool, len(req.ExcludeHosts))
+	for _, h := range req.ExcludeHosts {
+		excluded[h] = true
+	}
 	rows, err := tx.Query(q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("ledger: %w", err)
@@ -94,6 +109,9 @@ func loadSlots(tx *sql.Tx, req ClaimRequest) ([]*slot, error) {
 			return nil, fmt.Errorf("ledger: %w", err)
 		}
 		if allowed != nil && !allowed[c.Host] {
+			continue
+		}
+		if excluded[c.Host] {
 			continue
 		}
 		c.FirstSeen, c.LastSeen, c.Present = fromNS(fs), fromNS(ls), true
@@ -161,13 +179,20 @@ func fits(a, b *slot, k int) bool {
 	return a.host < b.host
 }
 
-// place chooses where n cards go when the caller named neither a host nor a card.
+// placeRange chooses where cards go when the caller named neither a host nor a card:
+// at least min, at most max, or nothing.
 //
-// Without spread all n go on one host, the closest fit (see fits). With spread each
-// card is placed by itself, one after another, by the same rule — which fills
-// one-card hosts and the holes in partly used ones first. Nothing is placed unless
-// all n are.
-func place(slots []*slot, n int, spread bool) ([]Card, Placement, error) {
+// Without spread all of them go on one host, the closest fit (see fits). With spread
+// each card is placed by itself, one after another, by the same rule — which fills
+// one-card hosts and the holes in partly used ones first.
+//
+// It is what a sweep needs. "Give me up to N, but at least K" is the shape of a job
+// that adapts to the fleet — 162 configs that can run on whatever is free — and the
+// all-or-none form made those agents count the fleet themselves, then lose the whole
+// batch to one card taken in between. When min == max the request is the ordinary one,
+// and nothing here is less strict: a partial result is only possible for a range, and
+// it is still the whole range or none.
+func placeRange(slots []*slot, min, max int, spread bool) ([]Card, Placement, error) {
 	idle, most, best := 0, 0, ""
 	for _, s := range slots {
 		idle += len(s.idle)
@@ -175,19 +200,54 @@ func place(slots []*slot, n int, spread bool) ([]Card, Placement, error) {
 			most, best = len(s.idle), s.host
 		}
 	}
-	short := &InsufficientError{Want: n, Spread: spread, MostOnOneHost: most, BestHost: best,
+	short := &InsufficientError{Want: min, Spread: spread, MostOnOneHost: most, BestHost: best,
 		Idle: idle, Hosts: len(slots)}
 	if spread {
-		return placeSpread(slots, n, short)
+		// A spread takes one card at a time, so it is bounded by the fleet, and an
+		// elastic one takes as many as exist up to max.
+		if idle < min {
+			return nil, Placement{}, short
+		}
+		n := min
+		if min != max {
+			if idle < max {
+				n = idle
+			} else {
+				n = max
+			}
+		}
+		cards, plc, err := placeSpread(slots, n, short)
+		if err != nil {
+			return nil, Placement{}, err
+		}
+		return cards, withRange(plc, min, max, n), nil
 	}
 	var can []*slot
 	for _, s := range slots {
-		if len(s.idle) >= n {
+		if len(s.idle) >= min {
 			can = append(can, s)
 		}
 	}
 	if len(can) == 0 {
 		return nil, Placement{}, short
+	}
+	// A range asks for as many as one machine can give, up to max, so that comes
+	// first: the hosts that could give the most are the only candidates, and the
+	// closest-fit rule chooses among them for that many cards. Ranking every host by
+	// fit for min, then taking what the winner happened to have, gave a 2..6 request
+	// four cards from a four-card machine while an eight-card one had six to give.
+	n := min
+	if min != max {
+		for _, s := range can {
+			n = maxInt(n, minInt(len(s.idle), max))
+		}
+		best := can[:0:0]
+		for _, s := range can {
+			if len(s.idle) >= n {
+				best = append(best, s)
+			}
+		}
+		can = best
 	}
 	sort.SliceStable(can, func(i, j int) bool { return fits(can[i], can[j], n) })
 	chosen := can[0]
@@ -201,13 +261,40 @@ func place(slots []*slot, n int, spread bool) ([]Card, Placement, error) {
 	}
 	plc.Reason = fmt.Sprintf("%s is the closest fit for %d card(s): %d of its %d cards were idle "+
 		"and %d stay idle", chosen.host, n, chosen.idle0, chosen.cards, chosen.idle0-n)
+	if min != max {
+		plc.Reason = fmt.Sprintf("%s can take %d card(s) now (asked for %d..%d): %d of its %d "+
+			"cards were idle and %d stay idle", chosen.host, n, min, max, chosen.idle0,
+			chosen.cards, chosen.idle0-n)
+	}
 	if chosen.partial() {
 		plc.Reason += "; it was already partly in use, which keeps whole machines free"
 	}
 	if len(can) > 1 {
 		plc.Reason += fmt.Sprintf(" (%d host(s) could take them; see candidates)", len(can))
 	}
-	return chosen.idle[:n], plc, nil
+	return chosen.idle[:n], withRange(plc, min, max, n), nil
+}
+
+// withRange records an elastic request's range and what it got.
+func withRange(plc Placement, min, max, got int) Placement {
+	if min != max {
+		plc.Range = &Requested{Min: min, Max: max, Got: got}
+	}
+	return plc
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func placeSpread(slots []*slot, n int, short *InsufficientError) ([]Card, Placement, error) {

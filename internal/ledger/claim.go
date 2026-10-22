@@ -19,8 +19,17 @@ type ClaimRequest struct {
 	// Hosts limits automatic placement to these machines; nil leaves every host the
 	// ledger knows. It is ignored when Host or GPUUUID names the place.
 	Hosts []string
-	// Count is how many cards, all or none. Zero means one.
+	// ExcludeHosts keeps automatic placement off these machines, whatever Hosts says.
+	// It is the negative form of Hosts, for "use the fleet except that one" — an
+	// instruction an operator gives in a sentence and could not express before without
+	// listing every other machine by name.
+	ExcludeHosts []string
+	// Count is how many cards, all or none. Zero means one. When Max is larger, Count
+	// is the minimum and the request takes as many as are idle, up to Max.
 	Count int
+	// Max is the upper bound of an elastic request; zero means the same as Count, which
+	// is the ordinary all-or-none claim.
+	Max int
 	// Spread lets automatic placement put the cards on different hosts: separate
 	// one-card jobs rather than one job on several cards. Without it every card is on
 	// one host, because a job across machines needs a network ftop knows nothing about.
@@ -29,6 +38,10 @@ type ClaimRequest struct {
 	// Adopt takes the card named by GPUUUID although processes are running on it:
 	// they are the caller's own, started before it claimed.
 	Adopt bool
+	// Keep turns off idle reclaim for this claim: the holder is between jobs on purpose,
+	// so an idle card is not an abandoned one. Without it a claim whose card shows no
+	// work for IdleReclaimAfter is released before its deadline.
+	Keep bool
 	// Owner is the declared identity. It is a display string, not a credential:
 	// every agent runs as the same unix user, so this cannot be authenticated and
 	// must never be used to grant anything.
@@ -191,16 +204,25 @@ func normalizeClaim(req *ClaimRequest) error {
 	if req.Count == 0 {
 		req.Count = 1
 	}
+	if req.Max == 0 {
+		req.Max = req.Count
+	}
 	switch {
-	case req.Count < 0:
+	case req.Count < 0 || req.Max < 0:
 		return fmt.Errorf("%w: the card count must be positive", ErrInvalid)
-	case req.GPUUUID != "" && req.Count > 1:
+	case req.Max < req.Count:
+		return fmt.Errorf("%w: the maximum (%d) is below the minimum (%d)", ErrInvalid,
+			req.Max, req.Count)
+	case req.GPUUUID != "" && req.Max > 1:
 		return fmt.Errorf("%w: a named card is one card; name a host to take several", ErrInvalid)
 	case req.Spread && (req.Host != "" || req.GPUUUID != ""):
 		return fmt.Errorf("%w: spread is for automatic placement; it cannot be combined "+
 			"with a named host or card", ErrInvalid)
 	case req.Adopt && req.GPUUUID == "":
 		return fmt.Errorf("%w: adopt takes a card by name; give its uuid", ErrInvalid)
+	case req.Max > req.Count && (req.Host != "" || req.GPUUUID != ""):
+		return fmt.Errorf("%w: a range is placed by ftop; it cannot be combined with a "+
+			"named host or card", ErrInvalid)
 	}
 	note := sanitizeText(req.Note, 1000)
 	directive := sanitizeText(req.Directive, 300)
@@ -230,14 +252,19 @@ func recordClaim(tx *sql.Tx, req ClaimRequest, gpu Card, group string, now time.
 		Directive: req.Directive, Group: group,
 		Created: now, Updated: now,
 		Expires: now.Add(req.For),
+		// Claiming a card is the assertion that it will be used, so the reclaim clock
+		// starts now rather than at the zero time (which would read as "idle forever").
+		LastBusy: now, Keep: req.Keep,
 	}
 	_, err := tx.Exec(`INSERT INTO claims
 		(id, host, gpu_uuid, owner, session, repo, branch, cwd, why, note, directive,
-		 created_ns, updated_ns, expires_ns, closed, close_cause, closed_ns, grp)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,'',0,?)`,
+		 created_ns, updated_ns, expires_ns, closed, close_cause, closed_ns, grp,
+		 last_busy_ns, keep)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,'',0,?,?,?)`,
 		c.ID, c.Host, c.GPUUUID, c.Owner, c.Session, c.Repo, c.Branch, c.Cwd,
 		c.Why, c.Note, c.Directive,
-		c.Created.UnixNano(), c.Updated.UnixNano(), c.Expires.UnixNano(), c.Group)
+		c.Created.UnixNano(), c.Updated.UnixNano(), c.Expires.UnixNano(), c.Group,
+		c.LastBusy.UnixNano(), boolInt(c.Keep))
 	if err != nil {
 		// The partial unique index is the authority on "one open claim per card".
 		// Losing that race is an ordinary conflict, not a database failure.
@@ -271,7 +298,7 @@ func chooseCards(tx *sql.Tx, req ClaimRequest) ([]Card, Placement, error) {
 	if req.Host != "" {
 		return chooseOnHost(tx, req, slots)
 	}
-	return place(slots, req.Count, req.Spread)
+	return placeRange(slots, req.Count, req.Max, req.Spread)
 }
 
 // chooseNamedCard checks that the card a request names may be taken.
@@ -765,28 +792,103 @@ func (s *Store) Renew(id, owner string, forDur time.Duration) (Claim, error) {
 }
 
 // renewIn moves one open claim's deadline inside tx.
+//
+// updated_ns is what a reclaiming observer reads, so a renew is also a statement that
+// the card is still wanted: it restarts the idle clock even if the card is between
+// jobs. That is the whole reason a holder has to do something — silence is what
+// eventually gives the card back.
 func renewIn(tx *sql.Tx, c *Claim, actor string, exp time.Time, now int64) error {
-	if _, err := tx.Exec(`UPDATE claims SET expires_ns = ?, updated_ns = ? WHERE id = ?`,
-		exp.UnixNano(), now, c.ID); err != nil {
+	if _, err := tx.Exec(`UPDATE claims SET expires_ns = ?, updated_ns = ?, last_busy_ns = ?
+		WHERE id = ?`, exp.UnixNano(), now, now, c.ID); err != nil {
 		return fmt.Errorf("ledger: %w", err)
 	}
 	if err := appendEvent(tx, now, "renew", c.ID, c.Host, c.GPUUUID, actor, ""); err != nil {
 		return err
 	}
-	c.Expires, c.Updated = exp, fromNS(now)
+	c.Expires, c.Updated, c.LastBusy = exp, fromNS(now), fromNS(now)
 	return nil
+}
+
+// SetKeep turns the idle reclaim for one claim, or a whole group, on or off.
+//
+// It is the holder's own switch and follows the holder rule: only the owner may flip
+// it, and a group is flipped whole.
+func (s *Store) SetKeep(id, owner string, keep bool) ([]Claim, error) {
+	now := nowNS()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("ledger: %w", err)
+	}
+	defer tx.Rollback()
+	cs, isGroup, err := claimsFor(tx, id)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range cs {
+		if owner != "" && c.Owner != ownerKey(owner) {
+			return nil, fmt.Errorf("%w: %s is held by %s", ErrNotOwner, c.ID, c.Owner)
+		}
+	}
+	for i := range cs {
+		if _, err := tx.Exec(`UPDATE claims SET keep = ?, updated_ns = ? WHERE id = ?`,
+			boolInt(keep), now, cs[i].ID); err != nil {
+			return nil, fmt.Errorf("ledger: %w", err)
+		}
+		detail := "reclaim turned off: the card is kept while idle"
+		if !keep {
+			detail = "reclaim turned back on"
+		}
+		if err := appendEvent(tx, now, "keep", cs[i].ID, cs[i].Host, cs[i].GPUUUID, owner,
+			detail); err != nil {
+			return nil, err
+		}
+		cs[i].Keep, cs[i].Updated = keep, fromNS(now)
+	}
+	if isGroup {
+		for i := range cs {
+			cs[i].Group = id
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("ledger: %w", err)
+	}
+	return cs, nil
+}
+
+// claimsFor resolves an id that may be a claim or a group to its open claims.
+func claimsFor(tx *sql.Tx, id string) (cs []Claim, isGroup bool, err error) {
+	if IsGroupID(id) {
+		cs, err = groupIn(tx, id, true)
+		return cs, true, err
+	}
+	c, err := loadClaim(tx, id)
+	if err != nil {
+		return nil, false, err
+	}
+	if c.Closed {
+		return nil, false, fmt.Errorf("%w: %s", ErrAlreadyClosed, id)
+	}
+	return []Claim{c}, false, nil
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func loadClaim(tx *sql.Tx, id string) (Claim, error) {
 	var c Claim
-	var created, updated, expires, closedNS int64
-	var closed int
+	var created, updated, expires, closedNS, busyNS int64
+	var closed, keep int
 	err := tx.QueryRow(`SELECT id, host, gpu_uuid, owner, session, repo, branch, cwd, why, note,
-		directive, created_ns, updated_ns, expires_ns, closed, close_cause, closed_ns, grp
+		directive, created_ns, updated_ns, expires_ns, closed, close_cause, closed_ns, grp,
+		last_busy_ns, keep
 		FROM claims WHERE id = ?`, id).
 		Scan(&c.ID, &c.Host, &c.GPUUUID, &c.Owner, &c.Session, &c.Repo, &c.Branch, &c.Cwd,
 			&c.Why, &c.Note, &c.Directive, &created, &updated, &expires, &closed,
-			&c.CloseCause, &closedNS, &c.Group)
+			&c.CloseCause, &closedNS, &c.Group, &busyNS, &keep)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Claim{}, fmt.Errorf("%w: %s", ErrNotFound, id)
 	}
@@ -795,6 +897,7 @@ func loadClaim(tx *sql.Tx, id string) (Claim, error) {
 	}
 	c.Created, c.Updated, c.Expires = fromNS(created), fromNS(updated), fromNS(expires)
 	c.Closed, c.ClosedAt = closed == 1, fromNS(closedNS)
+	c.LastBusy, c.Keep = fromNS(busyNS), keep == 1
 	return c, nil
 }
 
@@ -824,66 +927,153 @@ func appendEvent(tx *sql.Tx, at int64, kind, claimID, host, uuid, actor, detail 
 	return nil
 }
 
-// Sweep closes overdue claims whose card is OBSERVED idle, and returns the ones it
-// left alone because something may still be running.
+// Sweep closes claims that are over: those past their deadline, and those whose card
+// has been observed idle for longer than IdleReclaimAfter. It returns what it closed
+// and what it left alone.
 //
-// This is the whole of ftop's automatic cleanup, and its shape is the point. The
-// deadline alone never releases a card: a job that overran its estimate is still a
-// job, and handing its card to the next agent is the one failure the user said must
-// go to them. Only an observation that says "this card is idle" closes the claim —
-// `known == false` (the probe could not enumerate) is not that observation, and
-// neither is a card with no processes but memory in use that none accounts for.
+// This is the whole of ftop's automatic cleanup, and its shape is the point. Nothing
+// is closed on a deadline or a timer alone: the probe must have ENUMERATED the card and
+// found nothing on it. `known == false` is not that observation, neither is a card with
+// no processes but memory in use that none accounts for, and an overdue card that a job
+// is still using is kept — a job that overran its estimate is still a job, and handing
+// its card to the next agent is the one failure the user said must go to them.
+//
+// The second rule is what makes the fleet usable. An agent that finishes early and
+// forgets to release holds a card nobody can use until the deadline it guessed, which
+// the ledger's history shows was hours too long; a claim whose card has shown no work
+// for IdleReclaimAfter is treated as abandoned and closed with cause "idle". A claim
+// the holder marked Keep, or renewed within that window, is never reclaimed: renewing
+// is the holder saying the card is still wanted, and it restarts the clock.
 func (s *Store) Sweep(observed map[string]Observation) (released []Claim, kept []Claim, err error) {
-	now := nowNS()
+	now := time.Now()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return nil, nil, fmt.Errorf("ledger: %w", err)
 	}
 	defer tx.Rollback()
 
-	rows, err := tx.Query(`SELECT id FROM claims WHERE closed = 0 AND expires_ns <= ?`, now)
+	rows, err := tx.Query(`SELECT id, host, gpu_uuid, expires_ns, last_busy_ns, updated_ns,
+		keep FROM claims WHERE closed = 0`)
 	if err != nil {
 		return nil, nil, fmt.Errorf("ledger: %w", err)
 	}
-	var ids []string
+	var open []Claim
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
+		var c Claim
+		var exp, busy, updated int64
+		var keep int
+		if err := rows.Scan(&c.ID, &c.Host, &c.GPUUUID, &exp, &busy, &updated,
+			&keep); err != nil {
 			rows.Close()
 			return nil, nil, fmt.Errorf("ledger: %w", err)
 		}
-		ids = append(ids, id)
+		c.Expires, c.LastBusy, c.Updated = fromNS(exp), fromNS(busy), fromNS(updated)
+		c.Keep = keep == 1
+		open = append(open, c)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, nil, fmt.Errorf("ledger: %w", err)
 	}
 
-	for _, id := range ids {
-		c, err := loadClaim(tx, id)
-		if err != nil {
-			return nil, nil, err
-		}
+	for _, c := range open {
 		ob, seen := observed[c.GPUUUID]
-		if !seen || !ob.Idle() {
-			kept = append(kept, c)
+		overdue := !c.Expires.IsZero() && now.After(c.Expires)
+		// When the evidence was gathered, not when it reached this function: a pass
+		// over the fleet waits for its slowest host, and an idle reading taken before
+		// the window closed says nothing about the card after it.
+		at := ob.At
+		if at.IsZero() || at.After(now) {
+			at = now
+		}
+		// Work seen on the card is the only thing that moves last_busy forward, and
+		// it is read before the idle guard below, which a busy card fails by
+		// definition. A process counts on its own: a sample whose memory query failed
+		// but whose process list shows a job is still proof the job was running.
+		if seen && ob.Working() {
+			if err := touchBusy(tx, c.GPUUUID, at.UnixNano()); err != nil {
+				return nil, nil, err
+			}
+			if overdue {
+				kept = append(kept, c)
+			}
 			continue
 		}
-		if _, err := tx.Exec(`UPDATE claims SET closed = 1, closed_ns = ?, close_cause = 'expired',
-			updated_ns = ? WHERE id = ? AND closed = 0`, now, now, id); err != nil {
-			return nil, nil, fmt.Errorf("ledger: %w", err)
+		if !seen || !ob.Idle() {
+			if overdue {
+				kept = append(kept, c)
+			}
+			continue
 		}
-		if err := appendEvent(tx, now, "expired", id, c.Host, c.GPUUUID, "",
-			"deadline passed and the card was observed idle"); err != nil {
+		if overdue {
+			if err := closeIdle(tx, &c, "expired",
+				"deadline passed and the card was observed idle", now); err != nil {
+				return nil, nil, err
+			}
+			released = append(released, c)
+			continue
+		}
+		// Not overdue: only an idle claim older than the reclaim window is abandoned.
+		// updated_ns moves whenever the holder renews or changes the claim, so a live
+		// holder is never reclaimed; a claim written before last_busy existed (0) is
+		// judged from when it last changed, which is the same thing.
+		if c.Keep {
+			continue
+		}
+		since := c.LastBusy
+		if since.IsZero() || since.Before(c.Updated) {
+			since = c.Updated
+		}
+		// touchBusy coalesces writes within busyResolution, so the last work may have
+		// been seen up to that much after the recorded time. The window is measured
+		// from the latest it could have been, never shortened by the coalescing.
+		if at.Sub(since) < IdleReclaimAfter+busyResolution {
+			continue
+		}
+		if err := closeIdle(tx, &c, "idle", fmt.Sprintf(
+			"no work seen on the card for %s; reclaimed for the next job",
+			humanShort(at.Sub(since))), now); err != nil {
 			return nil, nil, err
 		}
-		c.Closed, c.CloseCause, c.ClosedAt = true, "expired", fromNS(now)
 		released = append(released, c)
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, nil, fmt.Errorf("ledger: %w", err)
 	}
 	return released, kept, nil
+}
+
+// busyResolution is how far last_busy may lag the last observation of work: touchBusy
+// does not rewrite a timestamp younger than this. The reclaim adds it to its window,
+// so coalescing never makes a card look idle sooner than IdleReclaimAfter.
+const busyResolution = time.Minute
+
+// touchBusy records that the card was in use at `at`, inside tx.
+//
+// It only writes when the recorded time is more than busyResolution older. An
+// observation happens on every listing, and rewriting the same timestamp for every busy
+// card each time turned a read into a write.
+func touchBusy(tx *sql.Tx, uuid string, at int64) error {
+	if _, err := tx.Exec(`UPDATE claims SET last_busy_ns = ?
+		WHERE gpu_uuid = ? AND closed = 0 AND last_busy_ns < ?`,
+		at, uuid, at-int64(busyResolution)); err != nil {
+		return fmt.Errorf("ledger: %w", err)
+	}
+	return nil
+}
+
+// closeIdle closes one claim inside tx because its card was observed idle.
+func closeIdle(tx *sql.Tx, c *Claim, cause, detail string, now time.Time) error {
+	ns := now.UnixNano()
+	if _, err := tx.Exec(`UPDATE claims SET closed = 1, closed_ns = ?, close_cause = ?,
+		updated_ns = ? WHERE id = ? AND closed = 0`, ns, cause, ns, c.ID); err != nil {
+		return fmt.Errorf("ledger: %w", err)
+	}
+	if err := appendEvent(tx, ns, cause, c.ID, c.Host, c.GPUUUID, "", detail); err != nil {
+		return err
+	}
+	c.Closed, c.CloseCause, c.ClosedAt, c.Updated = true, cause, now, now
+	return nil
 }
 
 func isUniqueViolation(err error) bool {

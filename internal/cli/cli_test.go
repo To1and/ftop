@@ -55,6 +55,8 @@ func dispatch(io_ IO, args []string) int {
 		return runRelease(io_, rest)
 	case "renew":
 		return runRenew(io_, rest)
+	case "keep":
+		return runKeep(io_, rest)
 	case "history":
 		return runHistory(io_, rest)
 	case "host":

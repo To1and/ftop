@@ -41,7 +41,12 @@ import (
 //
 // 3 adds claims.grp: the cards one claim command took, released and renewed
 // together.
-const SchemaVersion = 3
+//
+// 4 adds claims.last_busy_ns and claims.keep: the last time an observation saw work
+// on the card, which is what lets an idle card be reclaimed instead of waiting out a
+// deadline that was set hours too long, and the opt-out for a claim that is idle by
+// design.
+const SchemaVersion = 4
 
 // Errors callers act on. They are values, not strings, so the CLI can map them to
 // stable exit codes without matching on prose.
@@ -55,6 +60,9 @@ var (
 	ErrAlreadyClosed = errors.New("lease is already closed")
 	ErrNoCapacity    = errors.New("not enough idle cards")
 	ErrNotIdle       = errors.New("card is in use by work nobody claimed")
+	// ErrActivity is the idle-reclaim refusal: the holder asked to keep a card that
+	// is idle on purpose, and asking again will not change the answer.
+	ErrActivity = errors.New("holder keeps this card while it is idle")
 )
 
 // Claim is one lease on one card.
@@ -79,7 +87,7 @@ type Claim struct {
 	Expires  time.Time `json:"expires"`
 	Closed   bool      `json:"closed"`
 	ClosedAt time.Time `json:"closed_at,omitempty"`
-	// CloseCause is one of: released, expired, adopted, superseded.
+	// CloseCause is one of: released, expired, adopted, superseded, idle.
 	CloseCause string `json:"close_cause,omitempty"`
 	// Directives are the operator's own instructions that produced this claim
 	// ("use gpu-4", "take 2 cards"). They outrank any agent-to-agent negotiation.
@@ -88,6 +96,19 @@ type Claim struct {
 	// accept it, so a job on four cards is let go of in one step rather than four,
 	// and cannot leave one card behind. Claims made before groups existed have none.
 	Group string `json:"group,omitempty"`
+	// LastBusy is the last time an observation found work on this card: a process on
+	// it, or an idle card's ordinary memory in use. It starts at the claim's creation,
+	// because a card is claimed to be used.
+	//
+	// It is what distinguishes "the job is still running" from "the agent forgot".
+	// A deadline cannot: agents over-ask for time by an order of magnitude (the
+	// ledger's median ask was 14 hours for a 45-minute job), so expiry alone frees
+	// cards hours after the work ended.
+	LastBusy time.Time `json:"last_busy,omitempty"`
+	// Keep turns off idle reclaim: the holder is between jobs on purpose — preparing a
+	// dataset on the CPU, holding the set for the next stage — and the card stays theirs
+	// until they release it or its deadline passes.
+	Keep bool `json:"keep,omitempty"`
 }
 
 // Store is the ledger database.
@@ -244,7 +265,7 @@ func (s *Store) migrate() error {
 	for _, m := range []struct {
 		to    int
 		stmts []string
-	}{{1, v1Schema}, {2, v2Schema}, {3, v3Schema}} {
+	}{{1, v1Schema}, {2, v2Schema}, {3, v3Schema}, {4, v4Schema}} {
 		if v >= m.to {
 			continue
 		}
@@ -326,6 +347,18 @@ var v3Schema = []string{
 	// still released by its own id.
 	`ALTER TABLE claims ADD COLUMN grp TEXT NOT NULL DEFAULT ''`,
 	`CREATE INDEX IF NOT EXISTS claims_by_group ON claims(grp) WHERE grp != ''`,
+}
+
+var v4Schema = []string{
+	`ALTER TABLE claims ADD COLUMN last_busy_ns INTEGER NOT NULL DEFAULT 0`,
+	`ALTER TABLE claims ADD COLUMN keep INTEGER NOT NULL DEFAULT 0`,
+	// Every claim open at the upgrade starts its idle window at the upgrade. Before
+	// this column ftop recorded no activity at all, so the alternative — counting from
+	// when the claim last changed — treated a claim made six hours ago as idle for six
+	// hours, and reclaimed it the first time its job paused between stages. The upgrade
+	// is the first moment ftop starts watching; it is where the clock starts.
+	`UPDATE claims SET last_busy_ns = CAST(strftime('%s','now') AS INTEGER) * 1000000000
+		WHERE closed = 0`,
 }
 
 // sanitizeText makes a free-text field safe to store and display.

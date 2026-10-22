@@ -3,6 +3,7 @@ package cli
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +27,25 @@ func fakeSSH(t *testing.T, sample string) (log string) {
 	ProbeBin = []byte("synthetic probe")
 	t.Cleanup(func() { ProbeBin = old })
 	return log
+}
+
+// TestAPlacementObservesOnlyWhereItMayPlace: a manual host and an excluded host cannot
+// receive the claim, so they are not asked. Asking them cost time and could fail the
+// claim on a machine it was never going to use.
+func TestAPlacementObservesOnlyWhereItMayPlace(t *testing.T) {
+	store, cfg := placementFleet(t)
+	log := fakeSSH(t, "H\th\t1\t0\t0\t0\t0\t1\nE")
+	run(t, store, "claim", "-exclude-host", "lab-four", "-why", "x", "-for", "1h", "-as", "a",
+		"-config", cfg)
+	body := string(mustRead(t, log))
+	if !strings.Contains(body, "lab-two") {
+		t.Fatalf("the one placeable host was not observed:\n%s", body)
+	}
+	for _, h := range []string{"lab-four", "lab-desk"} {
+		if strings.Contains(body, h) {
+			t.Errorf("%s was observed although the claim could not use it:\n%s", h, body)
+		}
+	}
 }
 
 // TestAHostIsObservedEvenWhenAFilterHidesItsCards: -held keeps only claimed rows. A

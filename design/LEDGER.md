@@ -24,6 +24,14 @@ recommendations).
    machine (all or none), `-spread` makes them N independent one-card jobs, too few
    idle cards fails and says how many there are, and there is no queue. Hosts the
    operator marks `manual` in config.toml are never chosen, only named.
+9. *2026-10-22.* A claim is a reservation against idleness, not against the clock.
+   A card that has shown no work for 30 minutes is released before its deadline, by
+   the same evidence rule expiry uses; `-keep` (and `ftop keep`) turns that off, and
+   renewing restarts the window. Measured cause: 241 claims over two days, median ask
+   14 hours, median actual use 45 minutes, and 33 cards held for 13 hours after their
+   work had stopped. Also from the same measurement: a request may name a range
+   (`-n 4..40`, the sweep shape) and exclude hosts, because 200 of those 241 claims
+   were one sweep sharding itself across the fleet.
 
 Decisions 3 and 4 together removed most of the design both reviewers had produced.
 Decision 8 replaced "no scoring, no backfilling, no fairness": choosing among idle
@@ -86,8 +94,9 @@ of 71 requests (claims by one owner on one host within two minutes), 34 landed o
 bigger machine while a smaller one that fitted was idle, 16 of them by opening a
 completely idle large machine, and the one two-card machine was never used.
 
-A claim that names nothing now observes every host that is not `manual` and, for N
-cards on one machine, takes the host where they fit most closely:
+A claim that names nothing now observes every host that is not `manual`, minus any
+named by `-exclude-host`, and for N cards on one machine takes the host where they fit
+most closely:
 
 1. the fewest idle cards left over once these are placed;
 2. then a host already partly in use, so a hole is filled before a whole machine is
@@ -122,18 +131,52 @@ which `release` and `renew` accept, so a job's cards are let go of and extended
 together. A request that cannot be met records nothing and returns `no_capacity` with
 the most one machine could give and how many are idle in all.
 
+A request may also name a range (`-n 4..40`): at least four cards, at most forty, as
+many as are idle, placed by the same rule. That is the shape of a sweep — 162 configs
+that run on whatever the fleet has — which the all-or-none form forced agents to
+implement themselves by counting the fleet first, and then lose to a single card taken
+in between. The reply carries `requested: {min, max, got}` so the job is sized for what
+it received; under the minimum nothing is claimed at all.
+
 Not solved: a large request can starve. Filling holes keeps whole machines whole as long
 as possible, but under load small jobs eventually open them, and an eight-card machine
 is whole again only when its last claim ends. Fixing that needs queueing and holding a
 draining machine for the large job, which is a larger change than placement.
 
-## Expiry
+## Expiry and idle reclaim
 
 A deadline does not release a card. `Sweep` closes an overdue claim only when the
 probe enumerated that card's processes and found none; if the enumeration failed or a
 process is present, the claim stays and is reported `overdue`. The cost of being
 wrong this way is a stuck card a human can see; the cost of the other way is two
 agents writing to one GPU.
+
+A deadline is also the wrong clock (decision 9). `Sweep` therefore closes a claim that
+has shown no work for `IdleReclaimAfter` (30 minutes) even before its deadline, under
+the same evidentiary rule: enumerated, no processes, no memory nobody accounts for.
+`claims.last_busy_ns` moves forward only on an observation that saw work, so the
+window measures idleness, not silence. `claims.keep` turns the rule off for a holder
+that is idle on purpose. Renewing also restarts the window: it is the holder saying the
+card is still wanted, and it keeps the "no heartbeat required" property — a holder
+that says nothing is what eventually loses the card.
+
+Four details decide whether the rule can ever take a running job's card, and each was
+found by review:
+
+- The window is measured to when the idle reading was **taken**, not to when it reached
+  `Sweep`. A pass waits for its slowest host, and a reading from before the window
+  closed says nothing about the card after it.
+- A process on the card is work by itself. A sample whose memory query failed but whose
+  process list shows a job still moves `last_busy` forward; requiring both readings let
+  the clock start from an older time.
+- `last_busy` is written at most once a minute, so it may lag the last work by up to
+  that; the window adds the minute back rather than being shortened by it.
+- Claims open at the upgrade to schema 4 start their window at the upgrade. ftop kept
+  no activity before then, and counting from the claim's last change would reclaim a
+  six-hour-old claim the first time its job paused.
+
+A placement observes only the hosts it may place on, so a `manual` or excluded machine
+is neither contacted nor swept by it; `gpu list` still sweeps every host it observes.
 
 `Sweep` runs inside `claim`, `gpu list` and `gpu show` whenever they observe, because
 those are the only moments ftop has an observation and there is no daemon. Running it
@@ -257,7 +300,9 @@ Each has a regression test that fails on the old code.
 ## Not done on purpose
 
 - No queueing, no priority, no preemption. A request that cannot be met fails and
-  says what the fleet has.
+  says what the fleet has. `-n MIN..MAX` is the closest thing to a queue — it takes
+  what is free now — and is deliberately not one: a waiting caller would have to be a
+  daemon, and starving large jobs remains unsolved.
 - No per-card VRAM reservation.
 - No MCP server. The CLI plus the generated skill is the surface; an MCP adapter would
   be a thin wrapper over the same JSON.
