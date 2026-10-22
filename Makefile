@@ -1,7 +1,7 @@
 BINARY  := bin/ftop
 PROBE   := cmd/ftop/probe/ftop-probe
 GO      := go
-VERSION ?= 0.2.0
+VERSION ?= 0.3.0
 
 # The probe is cross-compiled for the fleet (linux/amd64, no cgo, no toolchain on
 # the remote side) and embedded. `make` must therefore build the probe BEFORE the

@@ -1,4 +1,4 @@
-# Release pipeline: `git tag v0.2.0 && git push origin v0.2.0` runs this on CI.
+# Release pipeline: `git tag v0.3.0 && git push origin v0.3.0` runs this on CI.
 #
 # ftop is a two-step build: the linux/amd64 probe is cross-compiled first, then the
 # TUI is compiled with `-tags probe` so `//go:embed probe/ftop-probe` finds it. The
