@@ -301,10 +301,28 @@ func Annotate(views []CardView, obs map[string]Observation) {
 			views[i].Conflict = "claim is past its deadline but the card is busy; " +
 				"the holder is still running — extend it or ask the operator"
 		case views[i].Claim != nil && known && ob.Procs == 0 && now.Sub(views[i].Claim.Updated) > 10*time.Minute:
-			views[i].Conflict = "held, but no process has been seen for a while; " +
-				"the holder may have finished without releasing"
+			// What ftop knows is that this observation found nothing on the card, and
+			// when the claim itself last changed. It has no history of the card's
+			// activity before last_busy was recorded, so the sentence must not claim
+			// one: "no process has been seen for a while" was a statement about a
+			// record ftop does not keep.
+			views[i].Conflict = fmt.Sprintf("held, and this observation found nothing on it "+
+				"(the claim was last changed %s ago); if the job is over, release it",
+				humanShort(now.Sub(views[i].Claim.Updated)))
 		}
 	}
+}
+
+// humanShort renders a duration the way a one-line conflict reads it: minutes under an
+// hour, hours under a day.
+func humanShort(d time.Duration) string {
+	switch {
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	}
+	return fmt.Sprintf("%dd", int(d.Hours()/24))
 }
 
 // History returns recent events for a card, newest first.

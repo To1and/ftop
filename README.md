@@ -268,7 +268,10 @@ Rules enforced rather than documented:
   in the history under whoever ran it.
 - **A card that leaves its host stops being claimable.** Its row is kept for the
   history and reported `present: false`; a host that could not be reached keeps
-  its cards.
+  its cards. The same goes for a machine removed from `~/.ssh/config`: its rows and
+  its claims stay, and its cards are counted under `summary.retired` instead of
+  inflating the fleet's `cards`, `free` and `unknown`. A retired card an open claim
+  still names is listed, because someone is working on it.
 
 `ftop` also says when the ledger and reality disagree. A card with no claim but
 running processes is reported as `unclaimed`, with the memory no process on that

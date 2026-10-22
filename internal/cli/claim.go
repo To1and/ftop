@@ -118,6 +118,27 @@ func runClaim(io_ IO, args []string) int {
 	}
 	defer s.Close()
 
+	// A named card must be on a machine that is still in the fleet. Naming the machine
+	// is refused once it leaves ssh_config (resolveHost), and naming one of its cards
+	// is the same request by another route; under -no-ssh it used to succeed and hand
+	// out a card on a machine the operator had taken away.
+	if *uuid != "" {
+		if h, ok, err := s.CardHost(*uuid); err != nil {
+			return emitErr(io_.Out, "claim", classify(err))
+		} else if ok {
+			if cfg, cerr := config.Load(expandHome(*cfgPath)); cerr == nil && cfg.Deliberate() {
+				inFleet := false
+				for _, x := range cfg.Hosts {
+					inFleet = inFleet || x.Name == h
+				}
+				if !inFleet {
+					return emitErr(io_.Out, "claim", stateErr(CodeUnknownCard,
+						"%s is on %s, which is no longer in the fleet", *uuid, h))
+				}
+			}
+		}
+	}
+
 	// With no host and no card named, ftop places the claim, on any host the user has
 	// not marked manual.
 	var placeOn []string

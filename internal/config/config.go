@@ -126,6 +126,13 @@ func LoadSettings(path string) *Config {
 // Err reports a config file that could not be decoded.
 func (c *Config) Err() error { return c.err }
 
+// Deliberate reports whether the fleet is what the user's config file says, rather
+// than whatever discovery found. An empty fleet means two different things: a config
+// that drops every host (`drop = ["*"]`) is a decision, and every machine is out of
+// it; no ssh_config at all is an absence of information, and says nothing about the
+// machines a ledger remembers.
+func (c *Config) Deliberate() bool { return c.resolved || len(c.Hosts) > 0 }
+
 // Load resolves the fleet from ssh_config and an optional TOML file.
 func Load(path string) (*Config, error) {
 	if path == "" {

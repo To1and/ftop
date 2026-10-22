@@ -46,6 +46,12 @@ type summary struct {
 	// returns, and the only count that answers "can I start now". It is zero under
 	// -no-ssh, which is not the same as "nothing is free".
 	Safe int `json:"safe"`
+	// Retired counts cards that are not part of the current fleet: their machine is
+	// no longer in ssh_config, or the card left its host's inventory. They are left
+	// out of every other count, because a machine that was removed is not a card
+	// somebody can take — but a held one is still counted as held, since its holder
+	// has to find it somewhere.
+	Retired int `json:"retired"`
 }
 
 // hostView is one machine.
@@ -160,8 +166,43 @@ func runGPUList(io_ IO, args []string) int {
 	if err != nil {
 		return emitErr(io_.Out, "gpu list", classify(err))
 	}
+	// Which machines are still in the fleet. A machine removed from ssh_config keeps
+	// its rows — and its claims, which is what made removing one safe — but its cards
+	// are not part of the fleet an agent is choosing from. Read from the config
+	// rather than from the observation, so -no-ssh and a host that did not answer
+	// classify the same way.
+	//
+	// A config that resolved to no hosts on purpose (`drop = ["*"]`) is a fleet of
+	// none, and every cached card is retired. A config ftop could not read, or no
+	// ssh_config at all, is different: that is not evidence about any machine, so
+	// nothing is retired on its account and the listing still shows what the ledger
+	// holds.
+	managed, fleetKnown := map[string]bool{}, false
+	if cfg, cerr := config.Load(expandHome(*cfgPath)); cerr == nil && cfg.Deliberate() {
+		fleetKnown = true
+		for _, h := range cfg.Hosts {
+			managed[h.Name] = true
+		}
+	}
+	retired := func(v ledger.CardView) bool {
+		return !v.Present || (fleetKnown && !managed[v.Host])
+	}
 	if obs != nil {
 		ledger.Annotate(views, obs)
+	}
+	// Observed is a property of the machine, read before any filter drops the card
+	// that carried the observation: -held keeps only claimed rows, and a host whose
+	// only claimed card is retired still answered just now.
+	observedAt := map[string]time.Time{}
+	for _, v := range views {
+		if o, ok := obs[v.GPUUUID]; ok && o.At.After(observedAt[v.Host]) {
+			observedAt[v.Host] = o.At
+		}
+	}
+	for _, name := range completed {
+		if _, ok := observedAt[name]; !ok {
+			observedAt[name] = time.Now()
+		}
 	}
 	// -safe answers "what may I take without disturbing anyone", which the ledger alone
 	// cannot: a free card with processes on it belongs to a job started outside ftop. It
@@ -176,23 +217,33 @@ func runGPUList(io_ IO, args []string) int {
 		}
 		views = kept
 	}
-
-	// Group by host in the same order the TUI uses, so a human moving between the
-	// two does not have to re-find a machine.
-	byHost := map[string]*hostView{}
-	var order []string
+	// Retired cards are left out of the listing and every fleet count. A card row is
+	// never deleted — its history is the point — so a resized container leaves its old
+	// card behind, and a machine taken out of ssh_config leaves all of its cards; the
+	// summary was answering "unknown: 20" about cards nobody could claim. They are
+	// counted under summary.retired instead.
+	//
+	// The one exception is a retired card an open claim still names. The holder's work
+	// is real and this listing may be the only place it shows, so the row is kept — and
+	// it is counted as held, which is true, but not as part of the fleet's cards, free,
+	// unknown or safe.
+	var retiredCount int
+	kept := views[:0]
 	for _, v := range views {
-		h, ok := byHost[v.Host]
-		if !ok {
-			h = &hostView{Host: v.Host, Label: labels[v.Host]}
-			if o, seen := obs[v.GPUUUID]; seen {
-				h.Observed = true
-				h.AgeSec = roundSec(time.Since(o.At))
+		if retired(v) {
+			retiredCount++
+			if v.Claim == nil {
+				continue
 			}
-			byHost[v.Host] = h
-			order = append(order, v.Host)
 		}
-		h.Cards = append(h.Cards, v)
+		kept = append(kept, v)
+	}
+	views = kept
+	byHost, order := groupByHost(views, obs, labels)
+	for name, h := range byHost {
+		if at, ok := observedAt[name]; ok {
+			h.Observed, h.AgeSec = true, roundSec(time.Since(at))
+		}
 	}
 	// An unobserved host still has to appear: its holdings are real even when it is
 	// unreachable, and hiding it would make a card look free. It carries the reason,
@@ -227,20 +278,28 @@ func runGPUList(io_ IO, args []string) int {
 	sort.Slice(order, func(i, j int) bool { return order[i] < order[j] })
 
 	data := gpuListData{Hosts: make([]hostView, 0, len(order))}
+	data.Summary.Retired = retiredCount
 	for _, name := range order {
 		h := byHost[name]
+		// Never nil: a host with no rows left is "no cards", and the listing promises
+		// arrays.
 		if h.Cards == nil {
 			h.Cards = []ledger.CardView{}
 		}
-		data.Summary.Cards += len(h.Cards)
 		for _, c := range h.Cards {
-			switch {
-			case c.Claim != nil:
+			if c.Claim != nil {
 				data.Summary.Held++
 				if c.Claim.Overdue() {
 					data.Summary.Overdue++
 				}
-			default:
+			}
+			// A retired row is here only because of its claim, and the claim is all it
+			// contributes: it is not one of the fleet's cards.
+			if retired(c) {
+				continue
+			}
+			data.Summary.Cards++
+			if c.Claim == nil {
 				data.Summary.Free++
 			}
 			// Unknown is derived from the observation, not from the conflict prose.
@@ -645,3 +704,34 @@ func safeToTake(v ledger.CardView) bool {
 // uploadBudget is the time a first contact may spend uploading the probe, on top
 // of the observation wait.
 const uploadBudget = 30 * time.Second
+
+// groupByHost lays a listing out by machine, in the same order the TUI uses so a
+// human moving between the two does not have to re-find a machine.
+//
+// "Observed" is a property of the MACHINE, not of whichever card came first. It used to
+// be read off the first card in the host's list, and a container host whose card 0 was
+// replaced keeps its retired card at index 0 — so a host sampled seconds ago reported
+// observed: false while every card it has was measured. Any observed card marks the
+// host, and its age is the newest observation: one pass samples every card on a
+// machine. runGPUList overrides both from the unfiltered rows, since a filter can drop
+// the card that carried the observation.
+func groupByHost(views []ledger.CardView, obs map[string]ledger.Observation,
+	labels map[string]string) (map[string]*hostView, []string) {
+	byHost := map[string]*hostView{}
+	newest := map[string]time.Time{}
+	var order []string
+	for _, v := range views {
+		h, ok := byHost[v.Host]
+		if !ok {
+			h = &hostView{Host: v.Host, Label: labels[v.Host]}
+			byHost[v.Host] = h
+			order = append(order, v.Host)
+		}
+		h.Cards = append(h.Cards, v)
+		if o, seen := obs[v.GPUUUID]; seen && !o.At.Before(newest[v.Host]) {
+			newest[v.Host] = o.At
+			h.Observed, h.AgeSec = true, roundSec(time.Since(o.At))
+		}
+	}
+	return byHost, order
+}

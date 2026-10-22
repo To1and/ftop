@@ -145,7 +145,10 @@ operator and take another card.
   the ledger. §unclaimed§ is a subset of §free§ (free cards with processes). §unknown§
   cuts across everything — it counts every card whose process list was not read, held
   ones included — so it is not a subset of §free§. §safe§ is the only count that answers
-  "can I start now": free, enumerated, and empty.
+  "can I start now": free, enumerated, and empty. §retired§ counts cards that are not
+  part of the fleet any more — their machine left §~/.ssh/config§, or the card left its
+  host — and they are in no other count. A retired card that still carries a claim is
+  listed, because someone is working on it.
 - **§unknown§ is not free.** It counts cards whose process list could not be read,
   including every card under §-no-ssh§.
 - **§unclaimed§** counts free cards that already have processes.
